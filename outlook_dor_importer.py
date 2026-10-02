@@ -414,14 +414,37 @@ def get_outlook_namespace():
     return outlook.GetNamespace("MAPI")
 
 
+def list_outlook_folder_paths(namespace) -> list[tuple[str, str]]:
+    """Returns folder names paired with their mailbox-rooted paths."""
+    folders = [("Inbox", "Inbox")]
+
+    def collect_folders(folder, parent_path=""):
+        folder_name = str(folder.Name).strip()
+        current_path = (
+            f"{parent_path}\\{folder_name}"
+            if parent_path
+            else folder_name
+        )
+        folders.append((folder_name, current_path))
+
+        for child_folder in folder.Folders:
+            collect_folders(child_folder, current_path)
+
+    for root_folder in namespace.Folders:
+        collect_folders(root_folder)
+
+    return sorted(
+        folders,
+        key=lambda item: (item[0].casefold(), item[1].casefold()),
+    )
+
+
 def get_outlook_folder(
     namespace,
     folder_path: str = "Inbox",
 ):
     """
-    Resolves Inbox or a folder path such as Inbox\Reports.
-
-    A mailbox-rooted path such as Mailbox Name\Reports is also supported.
+    Resolves Inbox paths, mailbox-rooted paths, and unique bare folder names.
     """
     requested_path = folder_path.strip() or "Inbox"
     path_parts = [
@@ -433,23 +456,90 @@ def get_outlook_folder(
     if not path_parts:
         path_parts = ["Inbox"]
 
+    logger.info("Resolving Outlook folder path: %s", requested_path)
+
     if path_parts[0].casefold() == "inbox":
         current_folder = namespace.GetDefaultFolder(
             OL_FOLDER_INBOX
         )
         path_parts = path_parts[1:]
+    elif len(path_parts) == 1:
+        all_folders = []
+
+        def collect_folders(folder, parent_path=""):
+            folder_name = str(folder.Name).strip()
+            current_path = (
+                f"{parent_path}\\{folder_name}"
+                if parent_path
+                else folder_name
+            )
+            all_folders.append(
+                (folder_name, current_path, folder)
+            )
+
+            for child_folder in folder.Folders:
+                collect_folders(child_folder, current_path)
+
+        for root_folder in namespace.Folders:
+            collect_folders(root_folder)
+
+        requested_name = path_parts[0].casefold()
+        exact_matches = [
+            match
+            for match in all_folders
+            if match[0].casefold() == requested_name
+        ]
+        matches = exact_matches or [
+            match
+            for match in all_folders
+            if requested_name in match[0].casefold()
+        ]
+
+        if len(matches) == 1:
+            logger.info(
+                'Resolved Outlook folder "%s" to "%s"',
+                requested_path,
+                matches[0][1],
+            )
+            return matches[0][2]
+
+        if matches:
+            matching_paths = "\n".join(
+                match[1]
+                for match in matches
+            )
+            raise RuntimeError(
+                f'Outlook folder name "{path_parts[0]}" matches '
+                "multiple folders. Enter a full folder path:\n\n"
+                f"{matching_paths}"
+            )
+
+        available_paths = "\n".join(
+            match[1]
+            for match in all_folders
+        ) or "None"
+        raise RuntimeError(
+            f'No Outlook folder matched "{path_parts[0]}".\n\n'
+            f"Available Outlook folders:\n{available_paths}"
+        )
     else:
         current_folder = None
+        mailbox_folders = list(namespace.Folders)
 
-        for folder in namespace.Folders:
+        for folder in mailbox_folders:
             if str(folder.Name).strip().casefold() == path_parts[0].casefold():
                 current_folder = folder
                 break
 
         if current_folder is None:
+            available_mailboxes = "\n".join(
+                str(folder.Name)
+                for folder in mailbox_folders
+            ) or "None"
             raise RuntimeError(
                 f'Outlook mailbox or folder root "{path_parts[0]}" '
-                "was not found."
+                "was not found.\n\n"
+                f"Available mailbox roots:\n{available_mailboxes}"
             )
 
         path_parts = path_parts[1:]
@@ -466,13 +556,24 @@ def get_outlook_folder(
                 break
 
         if next_folder is None:
+            available_folders = "\n".join(
+                str(folder.Name)
+                for folder in current_folder.Folders
+            ) or "None"
             raise RuntimeError(
                 f'Outlook folder "{requested_name}" was not found '
-                f'under "{current_folder.Name}".'
+                f'under "{current_folder.Name}".\n\n'
+                f"Available folders under this location:\n"
+                f"{available_folders}"
             )
 
         current_folder = next_folder
 
+    logger.info(
+        'Resolved Outlook folder "%s" to "%s"',
+        requested_path,
+        current_folder.Name,
+    )
     return current_folder
 
 
@@ -1751,6 +1852,9 @@ class OutlookDORImporterApp(tk.Tk):
         self.outlook_folder_var = tk.StringVar(
             value="Inbox"
         )
+        self.outlook_folder_paths = ["Inbox"]
+        self.outlook_folder_is_typed = False
+        self.folder_loading = False
 
         self.destination_var = tk.StringVar(
             value=DESTINATION_WORKBOOK_NAMES[
@@ -1792,6 +1896,10 @@ class OutlookDORImporterApp(tk.Tk):
         self.after(
             50,
             self.process_ui_events,
+        )
+        self.after(
+            100,
+            self.refresh_outlook_folders,
         )
 
     def post_ui_event(
@@ -2061,16 +2169,40 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             pady=5,
         )
 
-        outlook_folder_entry = ttk.Entry(
+        self.outlook_folder_dropdown = ttk.Combobox(
             settings_frame,
             textvariable=self.outlook_folder_var,
-            width=24,
+            values=("Inbox",),
+            state="normal",
+            width=32,
         )
 
-        outlook_folder_entry.grid(
+        self.outlook_folder_dropdown.grid(
             row=0,
             column=4,
             sticky="w",
+            padx=(8, 0),
+            pady=5,
+        )
+
+        self.outlook_folder_dropdown.bind(
+            "<<ComboboxSelected>>",
+            self.outlook_folder_selection_changed,
+        )
+        self.outlook_folder_dropdown.bind(
+            "<KeyRelease>",
+            self.outlook_folder_text_changed,
+        )
+
+        self.refresh_folders_button = ttk.Button(
+            settings_frame,
+            text="Refresh Folders",
+            command=self.refresh_outlook_folders,
+        )
+
+        self.refresh_folders_button.grid(
+            row=0,
+            column=5,
             padx=(8, 0),
             pady=5,
         )
@@ -2447,19 +2579,128 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         )
 
 
+    def selected_outlook_folder_path(self) -> str:
+        if self.outlook_folder_is_typed:
+            return self.outlook_folder_var.get().strip() or "Inbox"
+
+        selected_index = self.outlook_folder_dropdown.current()
+
+        if 0 <= selected_index < len(self.outlook_folder_paths):
+            return self.outlook_folder_paths[selected_index]
+
+        return self.outlook_folder_var.get().strip() or "Inbox"
+
+
+    def outlook_folder_text_changed(self, _event=None):
+        self.outlook_folder_is_typed = True
+
+
+    def outlook_folder_selection_changed(self, _event=None):
+        self.outlook_folder_is_typed = False
+        self.status_var.set(
+            "Selected Outlook folder: "
+            f"{self.selected_outlook_folder_path()}"
+        )
+
+
+    def refresh_outlook_folders(self):
+        if self.folder_loading:
+            return
+
+        self.folder_loading = True
+        self.refresh_folders_button.configure(
+            state="disabled"
+        )
+
+        threading.Thread(
+            target=self._outlook_folders_worker,
+            daemon=True,
+        ).start()
+
+    def _outlook_folders_worker(self):
+        folders = None
+        error = None
+        com_initialized = False
+
+        try:
+            pythoncom.CoInitialize()
+            com_initialized = True
+            namespace = get_outlook_namespace()
+            folders = list_outlook_folder_paths(namespace)
+        except Exception as caught_error:
+            error = caught_error
+        finally:
+            if com_initialized:
+                pythoncom.CoUninitialize()
+
+        self.post_ui_event(
+            self._finish_outlook_folders,
+            folders,
+            error,
+        )
+
+    def _finish_outlook_folders(
+        self,
+        folders: list[tuple[str, str]] | None,
+        error: Exception | None,
+    ):
+        self.folder_loading = False
+        self.refresh_folders_button.configure(
+            state="normal"
+        )
+
+        if error is not None:
+            logger.error(
+                "Could not load Outlook folders: %s",
+                error,
+            )
+            self.status_var.set(
+                "Could not load Outlook folders. "
+                "Check Outlook and select Refresh Folders to retry."
+            )
+            return
+
+        current_value = self.outlook_folder_var.get()
+        current_path = self.selected_outlook_folder_path()
+        folder_choices = folders or [("Inbox", "Inbox")]
+        folder_names = [name for name, _path in folder_choices]
+        self.outlook_folder_paths = [
+            path
+            for _name, path in folder_choices
+        ]
+        self.outlook_folder_dropdown.configure(
+            values=folder_names
+        )
+
+        try:
+            selected_index = self.outlook_folder_paths.index(
+                current_path
+            )
+        except ValueError:
+            self.outlook_folder_dropdown.set(current_value)
+            self.outlook_folder_is_typed = bool(current_value.strip())
+        else:
+            self.outlook_folder_dropdown.current(selected_index)
+            self.outlook_folder_is_typed = False
+
+        self.status_var.set(
+            f"Loaded {len(folder_choices)} Outlook folders."
+        )
+
+
     def refresh_attachments(self):
+        folder_path = self.selected_outlook_folder_path()
         self.set_busy(True)
         self.update_progress(
             10,
-            f"Searching Outlook "
-            f"{self.outlook_folder_var.get().strip() or 'Inbox'}..."
+            f"Searching Outlook {folder_path}..."
         )
 
         threading.Thread(
             target=self._refresh_attachments_worker,
             args=(
                 self.file_filter_var.get(),
-                self.outlook_folder_var.get(),
+                folder_path,
             ),
             daemon=True,
         ).start()
@@ -2897,6 +3138,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             f"Sheet: {result['sheet']}\n"
             f"Rows imported: {result['rows']}\n"
             f"Columns imported: {result['columns']}\n"
+            f"Import started at row: {result['first_row']}\n"
             f"Destination rows: "
             f"{result['first_row']} to "
             f"{result['last_row']}\n"
@@ -2966,16 +3208,11 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 # ============================================================
 
 if __name__ == "__main__":
-    log_folder = (
-        Path(tempfile.gettempdir())
-        / "OutlookDORImporter"
-    )
-    log_folder.mkdir(
-        parents=True,
-        exist_ok=True,
+    log_file = Path(__file__).with_name(
+        "process_timings.log"
     )
     logging.basicConfig(
-        filename=str(log_folder / "process_timings.log"),
+        filename=str(log_file),
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )

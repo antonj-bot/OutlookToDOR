@@ -45,7 +45,8 @@ python outlook_dor_importer.py
 1. Open the destination DOR workbook in Excel.
 2. Start the importer.
 3. Select `Ecrash` or `CGF`.
-4. Enter the Outlook folder to search. The default is `Inbox`.
+4. Select the Outlook folder from the dropdown. Click **Refresh Folders** to
+	reload the mailbox folder list; the default selection is `Inbox`.
 5. Optionally enter an additional filename filter.
 6. Select **Refresh Attachments**.
 7. Select an attachment and confirm the Production Date.
@@ -61,13 +62,14 @@ importing finishes.
 
 ## Outlook Folder Override
 
-The folder field accepts:
-
-- `Inbox` for the default Outlook Inbox.
-- `Inbox\Reports` for a subfolder under the default Inbox.
-- `Mailbox Name\Reports` for a folder under a specific mailbox.
-
-Folder matching is case-insensitive. The application searches up to the most recent 500 messages in the selected folder.
+The Outlook folder dropdown shows actual folder names. Each choice retains its
+full mailbox path for searching, so folders with the same name appear as
+separate choices. The selected folder's full path appears in the status line.
+The field is also editable: type a folder name such as `DOR` or a full path
+such as `Mailbox Name\Reports`. If a typed name matches multiple folders, use
+the dropdown to select the intended folder. Click **Refresh Folders** after
+mailbox folders change. The application searches up to the most recent 500
+messages in the selected folder.
 
 ## Expected Source Data
 
@@ -90,10 +92,12 @@ Destination workbook and sheet names are configured near the top of `outlook_dor
 Process timings are written to:
 
 ```text
-%TEMP%\OutlookDORImporter\process_timings.log
+process_timings.log
 ```
 
-The application also shows the timing summary when the window is closed.
+The log file is created next to `outlook_dor_importer.py`. It includes folder
+lookup details and process timings. The application also shows the timing
+summary when the window is closed.
 
 ## Troubleshooting
 
