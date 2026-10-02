@@ -66,10 +66,10 @@ The Outlook folder dropdown shows actual folder names. Each choice retains its
 full mailbox path for searching, so folders with the same name appear as
 separate choices. The selected folder's full path appears in the status line.
 The field is also editable: type a folder name such as `DOR` or a full path
-such as `Mailbox Name\Reports`. If a typed name matches multiple folders, use
-the dropdown to select the intended folder. Click **Refresh Folders** after
-mailbox folders change. The application searches up to the most recent 500
-messages in the selected folder.
+such as `Mailbox Name\Reports` to display matches as you type. If a typed name
+matches multiple folders, use the dropdown to select the intended folder.
+Click **Refresh Folders** after mailbox folders change. The application
+searches up to the most recent 500 messages in the selected folder.
 
 ## Expected Source Data
 
@@ -84,6 +84,12 @@ The destination sheet must contain:
 - `Week`
 - `Day`
 - `Production Date`
+
+After a successful import, the importer also writes a summary record to the
+open workbook's `DOR` sheet. It uses the selected Production Date in column A,
+leaves column B blank, and copies `H10` and `I10` from `Summary by date (All
+states)` into columns C and D. It writes to row 5 when `DOR!A5` is empty;
+otherwise, it inserts a row at 6.
 
 Destination workbook and sheet names are configured near the top of `outlook_dor_importer.py` in `DESTINATION_WORKBOOK_NAMES` and `DESTINATION_SHEETS`.
 
@@ -124,8 +130,8 @@ Ensure Outlook and Excel are installed as desktop applications, close unexpected
 
 | File | Purpose |
 | --- | --- |
-| `outlook_dor_importer.py` | Main application and import logic |
-| `main.py` | Reserved entry-point file; currently unused |
+| `outlook_dor_importer.py` | Outlook/Excel import logic and application launcher |
+| `outlook_dor_importer_ui.py` | Tkinter user interface |
 | `LICENSE` | MIT license |
 
 ## License

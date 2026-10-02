@@ -1,26 +1,16 @@
 from __future__ import annotations
 
-import ctypes
-import base64
-import queue
+import difflib
+import logging
 import re
-import subprocess
 import tempfile
 import threading
-import traceback
 import time
-import logging
-import difflib
-from ctypes import wintypes
 
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-import tkinter as tk
-from tkinter import ttk, messagebox
-
-import pythoncom
 import win32com.client
 
 
@@ -79,20 +69,6 @@ OL_FOLDER_INBOX = 6
 XL_UP = -4162
 XL_TO_LEFT = -4159
 XL_DOWN = -4121
-
-# Windows taskbar notification constants.
-FLASHW_TRAY = 0x00000002
-FLASHW_TIMERNOFG = 0x0000000C
-
-
-class FlashWindowInfo(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.UINT),
-        ("hwnd", wintypes.HWND),
-        ("dwFlags", wintypes.DWORD),
-        ("uCount", wintypes.UINT),
-        ("dwTimeout", wintypes.DWORD),
-    ]
 
 # ============================================================
 # PROCESS TIMING
@@ -437,6 +413,23 @@ def list_outlook_folder_paths(namespace) -> list[tuple[str, str]]:
         folders,
         key=lambda item: (item[0].casefold(), item[1].casefold()),
     )
+
+
+def filter_outlook_folder_choices(
+    folders: list[tuple[str, str]],
+    query: str,
+) -> list[tuple[str, str]]:
+    normalized_query = query.strip().casefold()
+
+    if not normalized_query:
+        return folders
+
+    return [
+        folder
+        for folder in folders
+        if normalized_query in folder[0].casefold()
+        or normalized_query in folder[1].casefold()
+    ]
 
 
 def get_outlook_folder(
@@ -1328,6 +1321,55 @@ def insert_destination_rows(
     )
 
 
+def append_dor_import_record(
+    dor_sheet,
+    production_date: date,
+    summary_values: tuple,
+) -> int:
+    """Writes the imported report's summary values to the DOR sheet."""
+    dor_row = 5
+    row_inserted = False
+
+    if has_value(dor_sheet.Cells(5, 1).Value):
+        dor_row = 6
+        insert_destination_rows(
+            dor_sheet,
+            dor_row,
+            1,
+        )
+        row_inserted = True
+
+    report_date = datetime.combine(
+        production_date,
+        datetime.min.time(),
+    )
+
+    try:
+        write_matrix(
+            dor_sheet,
+            dor_row,
+            1,
+            [[report_date, None, *summary_values]],
+        )
+        dor_sheet.Cells(
+            dor_row,
+            1,
+        ).NumberFormat = "mm/dd/yyyy"
+    except Exception:
+        if row_inserted:
+            dor_sheet.Rows("6:6").Delete(
+                Shift=XL_UP,
+            )
+        else:
+            dor_sheet.Range(
+                dor_sheet.Cells(dor_row, 1),
+                dor_sheet.Cells(dor_row, 4),
+            ).ClearContents()
+        raise
+
+    return dor_row
+
+
 def find_existing_week(
     destination_sheet,
     production_date: date,
@@ -1637,6 +1679,18 @@ def import_attachment(
         destination_workbook,
         destination_sheet_name,
     )
+    dor_sheet = find_sheet(
+        destination_workbook,
+        "DOR",
+    )
+    summary_sheet = find_sheet(
+        destination_workbook,
+        "Summary by date (All states)",
+    )
+    summary_values = (
+        summary_sheet.Cells(10, 8).Value,
+        summary_sheet.Cells(10, 9).Value,
+    )
 
     source_workbook = None
 
@@ -1782,6 +1836,12 @@ def import_attachment(
                 )
             raise
 
+        dor_row = append_dor_import_record(
+            dor_sheet,
+            production_date,
+            summary_values,
+        )
+
         destination_workbook.Save()
 
         return {
@@ -1795,6 +1855,7 @@ def import_attachment(
             ),
             "week": week_value,
             "week_source": week_source,
+            "dor_row": dor_row,
             "day": production_date.strftime(
                 "%A"
             ),
@@ -1818,1392 +1879,6 @@ def import_attachment(
             )
 
 # ============================================================
-# TKINTER APPLICATION
-# ============================================================
-
-class OutlookDORImporterApp(tk.Tk):
-
-    def __init__(self):
-        super().__init__()
-
-        self.title(
-            "Outlook DOR Importer"
-        )
-
-        self.geometry(
-            "1050x680"
-        )
-
-        self.minsize(
-            900,
-            580,
-        )
-
-        self.attachments: list[
-            AttachmentInfo
-        ] = []
-
-        self.queue_var = tk.StringVar(
-            value="Ecrash"
-        )
-
-        self.file_filter_var = tk.StringVar()
-
-        self.outlook_folder_var = tk.StringVar(
-            value="Inbox"
-        )
-        self.outlook_folder_paths = ["Inbox"]
-        self.outlook_folder_is_typed = False
-        self.folder_loading = False
-
-        self.destination_var = tk.StringVar(
-            value=DESTINATION_WORKBOOK_NAMES[
-                "Ecrash"
-            ]
-        )
-
-        self.production_date_var = (
-            tk.StringVar()
-        )
-
-        self.week_override_var = (
-            tk.StringVar()
-        )
-
-        self.row_override_var = (
-            tk.StringVar()
-        )
-
-        self.status_var = tk.StringVar(
-            value=(
-                "Ready. Select Refresh Attachments."
-            )
-        )
-
-        self.progress_target = 0.0
-        self.progress_animation_id = None
-        self.session_timer = SessionTimer()
-        self.ui_events = queue.Queue()
-        self.closing = False
-        self.action_active = False
-
-        self.protocol(
-            "WM_DELETE_WINDOW",
-            self.close_application,
-        )
-
-        self.create_widgets()
-        self.after(
-            50,
-            self.process_ui_events,
-        )
-        self.after(
-            100,
-            self.refresh_outlook_folders,
-        )
-
-    def post_ui_event(
-        self,
-        callback,
-        *args,
-    ):
-        self.ui_events.put(
-            (callback, args)
-        )
-
-    def process_ui_events(self):
-        if self.closing:
-            return
-
-        while True:
-            try:
-                callback, args = self.ui_events.get_nowait()
-            except queue.Empty:
-                break
-
-            callback(*args)
-
-        self.after(
-            50,
-            self.process_ui_events,
-        )
-
-    def animate_progress(
-        self,
-        target_value: float,
-    ):
-        self.progress_target = max(
-            0.0,
-            min(100.0, float(target_value)),
-        )
-
-        if self.progress_animation_id is None:
-            self.progress_animation_id = self.after(
-                16,
-                self._animate_progress_step,
-            )
-
-    def _animate_progress_step(self):
-        current = float(
-            self.progress["value"]
-        )
-
-        distance = self.progress_target - current
-
-        if abs(distance) <= 0.25:
-            current = self.progress_target
-            self.progress["value"] = current
-            self.progress_percent_var.set(
-                f"{round(current)}%"
-            )
-            self.progress_animation_id = None
-            return
-
-        step = max(
-            0.5,
-            abs(distance) * 0.12,
-        )
-
-        current += step if distance > 0 else -step
-        self.progress["value"] = current
-        self.progress_percent_var.set(
-            f"{round(current)}%"
-        )
-
-        self.progress_animation_id = self.after(
-            16,
-            self._animate_progress_step,
-        )
-
-
-    def notify_action_complete(
-        self,
-        title: str,
-        message: str,
-    ):
-        """
-        Shows a Windows toast and taskbar attention when the app is inactive.
-        """
-        try:
-            window_handle = self.winfo_id()
-            user32 = ctypes.windll.user32
-            is_inactive = (
-                self.state() == "iconic"
-                or user32.GetForegroundWindow()
-                != window_handle
-            )
-
-            if not is_inactive:
-                return
-
-            self.bell()
-
-            flash_info = FlashWindowInfo(
-                cbSize=ctypes.sizeof(FlashWindowInfo),
-                hwnd=window_handle,
-                dwFlags=FLASHW_TRAY | FLASHW_TIMERNOFG,
-                uCount=3,
-                dwTimeout=0,
-            )
-
-            user32.FlashWindowEx(
-                ctypes.byref(flash_info)
-            )
-
-            escaped_title = title.replace(
-                "'",
-                "''",
-            )
-            escaped_message = message.replace(
-                "'",
-                "''",
-            )
-
-            notification_icon = Path(
-                __file__
-            ).with_name(
-                "outlook_dor_importer.png"
-            )
-
-            if notification_icon.exists():
-                toast_template = "ToastImageAndText02"
-                image_uri = notification_icon.as_uri().replace(
-                    "'",
-                    "''",
-                )
-                image_script = f"""
-$image = $xml.GetElementsByTagName('image').Item(0)
-$image.SetAttribute('src', '{image_uri}')
-"""
-            else:
-                toast_template = "ToastText02"
-                image_script = ""
-
-            powershell_script = f"""
-[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
-$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::{toast_template})
-$text = $xml.GetElementsByTagName('text')
-$text.Item(0).AppendChild($xml.CreateTextNode('{escaped_title}')) > $null
-$text.Item(1).AppendChild($xml.CreateTextNode('{escaped_message}')) > $null
-{image_script}
-$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('AutoDOR').Show($toast)
-"""
-
-            encoded_script = base64.b64encode(
-                powershell_script.encode("utf-16le")
-            ).decode("ascii")
-
-            subprocess.Popen(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-EncodedCommand",
-                    encoded_script,
-                ],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-
-        except Exception:
-            logger.debug(
-                "Could not notify about completed action",
-                exc_info=True,
-            )
-
-    
-    def create_widgets(self):
-        main_frame = ttk.Frame(
-            self,
-            padding=16,
-        )
-
-        main_frame.pack(
-            fill="both",
-            expand=True,
-        )
-
-        title_label = ttk.Label(
-            main_frame,
-            text="Outlook to DOR Excel Importer",
-            font=(
-                "Segoe UI",
-                17,
-                "bold",
-            ),
-        )
-
-        title_label.pack(
-            anchor="w"
-        )
-
-        subtitle_label = ttk.Label(
-            main_frame,
-            text=(
-                "Choose an Outlook Excel attachment, "
-                "filter its Work Type, and append it "
-                "to the open DOR workbook."
-            ),
-        )
-
-        subtitle_label.pack(
-            anchor="w",
-            pady=(3, 14),
-        )
-
-        settings_frame = ttk.LabelFrame(
-            main_frame,
-            text="Import Settings",
-            padding=12,
-        )
-
-        settings_frame.pack(
-            fill="x"
-        )
-
-        ttk.Label(
-            settings_frame,
-            text="Queue:",
-        ).grid(
-            row=0,
-            column=0,
-            sticky="w",
-            pady=5,
-        )
-
-        queue_dropdown = ttk.Combobox(
-            settings_frame,
-            textvariable=self.queue_var,
-            values=(
-                "Ecrash",
-                "CGF",
-            ),
-            state="readonly",
-            width=18,
-        )
-
-        queue_dropdown.grid(
-            row=0,
-            column=1,
-            sticky="w",
-            padx=(8, 0),
-            pady=5,
-        )
-
-        queue_dropdown.bind(
-            "<<ComboboxSelected>>",
-            self.queue_changed,
-        )
-
-        ttk.Label(
-            settings_frame,
-            text="Outlook folder:",
-        ).grid(
-            row=0,
-            column=3,
-            sticky="e",
-            padx=(16, 0),
-            pady=5,
-        )
-
-        self.outlook_folder_dropdown = ttk.Combobox(
-            settings_frame,
-            textvariable=self.outlook_folder_var,
-            values=("Inbox",),
-            state="normal",
-            width=32,
-        )
-
-        self.outlook_folder_dropdown.grid(
-            row=0,
-            column=4,
-            sticky="w",
-            padx=(8, 0),
-            pady=5,
-        )
-
-        self.outlook_folder_dropdown.bind(
-            "<<ComboboxSelected>>",
-            self.outlook_folder_selection_changed,
-        )
-        self.outlook_folder_dropdown.bind(
-            "<KeyRelease>",
-            self.outlook_folder_text_changed,
-        )
-
-        self.refresh_folders_button = ttk.Button(
-            settings_frame,
-            text="Refresh Folders",
-            command=self.refresh_outlook_folders,
-        )
-
-        self.refresh_folders_button.grid(
-            row=0,
-            column=5,
-            padx=(8, 0),
-            pady=5,
-        )
-
-        ttk.Label(
-            settings_frame,
-            text="Additional filename filter:",
-        ).grid(
-            row=1,
-            column=0,
-            sticky="w",
-            pady=5,
-        )
-
-        file_filter_entry = ttk.Entry(
-            settings_frame,
-            textvariable=(
-                self.file_filter_var
-            ),
-        )
-
-        file_filter_entry.grid(
-            row=1,
-            column=1,
-            columnspan=2,
-            sticky="ew",
-            padx=(8, 0),
-            pady=5,
-        )
-
-        refresh_button = ttk.Button(
-            settings_frame,
-            text="Refresh Attachments",
-            command=self.refresh_attachments,
-        )
-
-        refresh_button.grid(
-            row=1,
-            column=3,
-            padx=(10, 0),
-            pady=5,
-        )
-
-        latest_button = ttk.Button(
-            settings_frame,
-            text="Select Latest",
-            command=self.select_latest,
-        )
-
-        latest_button.grid(
-            row=1,
-            column=4,
-            padx=(8, 0),
-            pady=5,
-        )
-
-        ttk.Label(
-            settings_frame,
-            text="Open destination workbook:",
-        ).grid(
-            row=2,
-            column=0,
-            sticky="w",
-            pady=5,
-        )
-
-        destination_entry = ttk.Entry(
-            settings_frame,
-            textvariable=(
-                self.destination_var
-            ),
-        )
-
-        destination_entry.grid(
-            row=2,
-            column=1,
-            columnspan=4,
-            sticky="ew",
-            padx=(8, 0),
-            pady=5,
-        )
-
-        ttk.Label(
-            settings_frame,
-            text="Production Date:",
-        ).grid(
-            row=3,
-            column=0,
-            sticky="w",
-            pady=5,
-        )
-
-        production_date_entry = ttk.Entry(
-            settings_frame,
-            textvariable=(
-                self.production_date_var
-            ),
-            width=18,
-        )
-
-        production_date_entry.grid(
-            row=3,
-            column=1,
-            sticky="w",
-            padx=(8, 0),
-            pady=5,
-        )
-
-        ttk.Label(
-            settings_frame,
-            text=(
-                "YYYY-MM-DD or MM/DD/YYYY"
-            ),
-        ).grid(
-            row=3,
-            column=2,
-            sticky="w",
-            padx=8,
-        )
-
-        ttk.Label(
-            settings_frame,
-            text="Week override:",
-        ).grid(
-            row=3,
-            column=3,
-            sticky="e",
-            padx=(8, 0),
-        )
-
-        week_override_entry = ttk.Entry(
-            settings_frame,
-            textvariable=(
-                self.week_override_var
-            ),
-            width=16,
-        )
-
-        week_override_entry.grid(
-            row=3,
-            column=4,
-            sticky="w",
-            padx=(8, 0),
-        )
-
-        ttk.Label(
-            settings_frame,
-            text="Insert at row (optional):",
-        ).grid(
-            row=4,
-            column=0,
-            sticky="w",
-            pady=5,
-        )
-
-        row_override_entry = ttk.Entry(
-            settings_frame,
-            textvariable=self.row_override_var,
-            width=18,
-        )
-
-        row_override_entry.grid(
-            row=4,
-            column=1,
-            sticky="w",
-            padx=(8, 0),
-            pady=5,
-        )
-
-        ttk.Label(
-            settings_frame,
-            text="Rows at this position will move down.",
-        ).grid(
-            row=4,
-            column=2,
-            columnspan=3,
-            sticky="w",
-            padx=8,
-        )
-
-        settings_frame.columnconfigure(
-            2,
-            weight=1,
-        )
-
-        attachment_frame = ttk.LabelFrame(
-            main_frame,
-            text="Available Excel Attachments",
-            padding=10,
-        )
-
-        attachment_frame.pack(
-            fill="both",
-            expand=True,
-            pady=(14, 10),
-        )
-
-        self.attachment_listbox = tk.Listbox(
-            attachment_frame,
-            font=(
-                "Consolas",
-                9,
-            ),
-            activestyle="dotbox",
-        )
-
-        attachment_scrollbar = ttk.Scrollbar(
-            attachment_frame,
-            orient="vertical",
-            command=(
-                self
-                .attachment_listbox
-                .yview
-            ),
-        )
-
-        self.attachment_listbox.configure(
-            yscrollcommand=(
-                attachment_scrollbar.set
-            )
-        )
-
-        self.attachment_listbox.pack(
-            side="left",
-            fill="both",
-            expand=True,
-        )
-
-        attachment_scrollbar.pack(
-            side="right",
-            fill="y",
-        )
-
-        self.attachment_listbox.bind(
-            "<<ListboxSelect>>",
-            self.attachment_selection_changed,
-        )
-
-        self.import_button = ttk.Button(
-            main_frame,
-            text="Import Selected Attachment",
-            command=self.run_import,
-        )
-        
-        progress_frame = ttk.Frame(
-            main_frame,
-        )
-
-        progress_frame.pack(
-            fill="x",
-            pady=(0, 10),
-        )
-
-        self.progress = ttk.Progressbar(
-            progress_frame,
-            mode="determinate",
-        )
-
-        self.progress.pack(
-            side="left",
-            fill="x",
-            expand=True,
-        )
-
-        self.progress_percent_var = tk.StringVar(
-            value="0%"
-        )
-
-        progress_percent_label = ttk.Label(
-            progress_frame,
-            textvariable=self.progress_percent_var,
-            width=5,
-            anchor="e",
-        )
-
-        progress_percent_label.pack(
-            side="right",
-            padx=(10, 0),
-        )
-
-        self.import_button.pack(
-            anchor="e",
-            pady=(0, 10),
-        )
-
-        status_frame = ttk.LabelFrame(
-            main_frame,
-            text="Status",
-            padding=10,
-        )
-
-        status_frame.pack(
-            fill="x"
-        )
-
-        status_label = ttk.Label(
-            status_frame,
-            textvariable=self.status_var,
-            justify="left",
-            wraplength=980,
-        )
-
-        status_label.pack(
-            anchor="w"
-        )
-
-
-    def set_busy(
-        self,
-        busy: bool,
-    ):
-        self.action_active = busy
-
-        if busy:
-            self.progress.configure(
-                mode="determinate"
-            )
-            self.progress["value"] = 0
-            self.progress_target = 0.0
-            self.progress_percent_var.set("0%")
-
-            self.configure(
-                cursor="watch"
-            )
-
-            self.import_button.configure(
-                state="disabled"
-            )
-
-        else:
-            self.configure(
-                cursor=""
-            )
-
-            self.import_button.configure(
-                state="normal"
-            )
-
-        self.update_idletasks()
-
-    def update_progress(
-        self,
-        value: int,
-        message: str = "",
-    ):
-        value = max(
-            0,
-            min(100, value),
-        )
-
-        self.animate_progress(value)
-
-        if message:
-            self.status_var.set(message)
-
-        self.update_idletasks()
-
-    def queue_changed(
-        self,
-        _event=None,
-    ):
-        selected_queue = (
-            self.queue_var.get()
-        )
-
-        destination_name = (
-            DESTINATION_WORKBOOK_NAMES[
-                selected_queue
-            ]
-        )
-
-        self.destination_var.set(
-            destination_name
-        )
-
-
-    def selected_outlook_folder_path(self) -> str:
-        if self.outlook_folder_is_typed:
-            return self.outlook_folder_var.get().strip() or "Inbox"
-
-        selected_index = self.outlook_folder_dropdown.current()
-
-        if 0 <= selected_index < len(self.outlook_folder_paths):
-            return self.outlook_folder_paths[selected_index]
-
-        return self.outlook_folder_var.get().strip() or "Inbox"
-
-
-    def outlook_folder_text_changed(self, _event=None):
-        self.outlook_folder_is_typed = True
-
-
-    def outlook_folder_selection_changed(self, _event=None):
-        self.outlook_folder_is_typed = False
-        self.status_var.set(
-            "Selected Outlook folder: "
-            f"{self.selected_outlook_folder_path()}"
-        )
-
-
-    def refresh_outlook_folders(self):
-        if self.folder_loading:
-            return
-
-        self.folder_loading = True
-        self.refresh_folders_button.configure(
-            state="disabled"
-        )
-
-        threading.Thread(
-            target=self._outlook_folders_worker,
-            daemon=True,
-        ).start()
-
-    def _outlook_folders_worker(self):
-        folders = None
-        error = None
-        com_initialized = False
-
-        try:
-            pythoncom.CoInitialize()
-            com_initialized = True
-            namespace = get_outlook_namespace()
-            folders = list_outlook_folder_paths(namespace)
-        except Exception as caught_error:
-            error = caught_error
-        finally:
-            if com_initialized:
-                pythoncom.CoUninitialize()
-
-        self.post_ui_event(
-            self._finish_outlook_folders,
-            folders,
-            error,
-        )
-
-    def _finish_outlook_folders(
-        self,
-        folders: list[tuple[str, str]] | None,
-        error: Exception | None,
-    ):
-        self.folder_loading = False
-        self.refresh_folders_button.configure(
-            state="normal"
-        )
-
-        if error is not None:
-            logger.error(
-                "Could not load Outlook folders: %s",
-                error,
-            )
-            self.status_var.set(
-                "Could not load Outlook folders. "
-                "Check Outlook and select Refresh Folders to retry."
-            )
-            return
-
-        current_value = self.outlook_folder_var.get()
-        current_path = self.selected_outlook_folder_path()
-        folder_choices = folders or [("Inbox", "Inbox")]
-        folder_names = [name for name, _path in folder_choices]
-        self.outlook_folder_paths = [
-            path
-            for _name, path in folder_choices
-        ]
-        self.outlook_folder_dropdown.configure(
-            values=folder_names
-        )
-
-        try:
-            selected_index = self.outlook_folder_paths.index(
-                current_path
-            )
-        except ValueError:
-            self.outlook_folder_dropdown.set(current_value)
-            self.outlook_folder_is_typed = bool(current_value.strip())
-        else:
-            self.outlook_folder_dropdown.current(selected_index)
-            self.outlook_folder_is_typed = False
-
-        self.status_var.set(
-            f"Loaded {len(folder_choices)} Outlook folders."
-        )
-
-
-    def refresh_attachments(self):
-        folder_path = self.selected_outlook_folder_path()
-        self.set_busy(True)
-        self.update_progress(
-            10,
-            f"Searching Outlook {folder_path}..."
-        )
-
-        threading.Thread(
-            target=self._refresh_attachments_worker,
-            args=(
-                self.file_filter_var.get(),
-                folder_path,
-            ),
-            daemon=True,
-        ).start()
-
-    def _refresh_attachments_worker(
-        self,
-        file_name_filter: str,
-        folder_path: str,
-    ):
-        attachments = None
-        error = None
-        process_started_at = self.session_timer.start()
-
-        com_initialized = False
-        try:
-            pythoncom.CoInitialize()
-            com_initialized = True
-
-            attachments = list_excel_attachments(
-                file_name_filter,
-                folder_path,
-            )
-
-        except Exception as caught_error:
-            error = caught_error
-
-        finally:
-            if com_initialized:
-                pythoncom.CoUninitialize()
-
-        duration_seconds = self.session_timer.finish(
-            "Refresh Attachments",
-            process_started_at,
-            error is None,
-            error,
-        )
-
-        self.post_ui_event(
-            self._finish_refresh_attachments,
-            attachments,
-            error,
-            duration_seconds,
-        )
-
-    def _finish_refresh_attachments(
-        self,
-        attachments,
-        error,
-        duration_seconds: float,
-    ):
-        if error is not None:
-            self.notify_action_complete(
-                "Attachment refresh failed",
-                "Outlook attachments could not be loaded.",
-            )
-            self.status_var.set(
-                f"Refresh Attachments failed after "
-                f"{duration_seconds:.2f} seconds."
-            )
-            self.show_error(
-                "Could not search Outlook",
-                error,
-            )
-            self.set_busy(False)
-            return
-
-        self.notify_action_complete(
-            "Attachment refresh finished",
-            "Outlook attachments are ready to review.",
-        )
-
-        self.attachments = attachments or []
-
-        self.update_progress(
-            65,
-            "Loading matching attachments..."
-        )
-
-        self.attachment_listbox.delete(
-            0,
-            tk.END,
-        )
-
-        for attachment in self.attachments:
-            self.attachment_listbox.insert(
-                tk.END,
-                attachment.display_name,
-            )
-
-        self.update_progress(
-            85,
-            "Preparing attachment selection..."
-        )
-
-        if not self.attachments:
-            self.update_progress(
-                100,
-                "No matching Excel attachments were found. "
-                f"Finished in {duration_seconds:.2f} seconds."
-            )
-            self.set_busy(False)
-            return
-
-        self.select_latest()
-
-        summary = (
-            f"Found {len(self.attachments)} "
-            "matching attachment(s) in "
-            f"{duration_seconds:.2f} seconds."
-        )
-
-        self.update_progress(
-            100,
-            summary,
-        )
-        self.set_busy(False)
-
-
-
-    def select_latest(self):
-        if not self.attachments:
-            self.refresh_attachments()
-            return
-
-        self.attachment_listbox.selection_clear(
-            0,
-            tk.END,
-        )
-
-        self.attachment_listbox.selection_set(
-            0
-        )
-
-        self.attachment_listbox.activate(
-            0
-        )
-
-        self.attachment_listbox.see(
-            0
-        )
-
-        self.attachment_selection_changed()
-
-
-    def get_selected_attachment(
-        self,
-    ) -> AttachmentInfo | None:
-        selected_indexes = (
-            self
-            .attachment_listbox
-            .curselection()
-        )
-
-        if not selected_indexes:
-            return None
-
-        selected_index = int(
-            selected_indexes[0]
-        )
-
-        return self.attachments[
-            selected_index
-        ]
-
-
-    def attachment_selection_changed(
-        self,
-        _event=None,
-    ):
-        attachment = (
-            self.get_selected_attachment()
-        )
-
-        if attachment is None:
-            return
-
-        detected_date = (
-            extract_date_from_filename(
-                attachment.file_name
-            )
-        )
-
-        if detected_date is None:
-            self.production_date_var.set(
-                ""
-            )
-
-            self.status_var.set(
-                "No date was detected in the filename. "
-                "Enter Production Date manually."
-            )
-
-            return
-
-        self.production_date_var.set(
-            detected_date.strftime(
-                "%Y-%m-%d"
-            )
-        )
-
-        detected_day = (
-            detected_date.strftime(
-                "%A"
-            )
-        )
-
-        self.status_var.set(
-            f"Detected "
-            f"{detected_date.strftime('%m/%d/%Y')} "
-            f"({detected_day}) from the filename."
-        )
-
-
-    def run_import(self):
-        selected_attachment = (
-            self.get_selected_attachment()
-        )
-
-        if selected_attachment is None:
-            messagebox.showwarning(
-                "No attachment",
-                "Select an attachment first.",
-            )
-
-            return
-
-        destination_name = (
-            self.destination_var
-            .get()
-            .strip()
-        )
-
-        if not destination_name:
-            messagebox.showwarning(
-                "Missing destination",
-                "Enter the name of the open "
-                "destination workbook.",
-            )
-
-            return
-
-        try:
-            production_date = parse_date(
-                self.production_date_var.get()
-            )
-
-        except ValueError as error:
-            messagebox.showerror(
-                "Invalid date",
-                str(error),
-            )
-
-            return
-
-        row_override_text = self.row_override_var.get().strip()
-        row_override = None
-
-        if row_override_text:
-            try:
-                row_override = int(row_override_text)
-            except ValueError:
-                messagebox.showerror(
-                    "Invalid row",
-                    "Insert at row must be a whole number.",
-                )
-
-                return
-
-            if row_override < 2:
-                messagebox.showerror(
-                    "Invalid row",
-                    "Insert at row must be 2 or greater.",
-                )
-
-                return
-
-        self.set_busy(True)
-        self.update_progress(
-            10,
-            f'Downloading "'
-            f'{selected_attachment.file_name}'
-            f'" from Outlook...'
-        )
-
-        threading.Thread(
-            target=self._import_worker,
-            args=(
-                selected_attachment,
-                destination_name,
-                production_date,
-                self.queue_var.get(),
-                self.week_override_var.get(),
-                row_override,
-            ),
-            daemon=True,
-        ).start()
-
-    def _import_worker(
-        self,
-        selected_attachment: AttachmentInfo,
-        destination_name: str,
-        production_date: date,
-        selected_queue: str,
-        week_override: str,
-        row_override: int | None,
-    ):
-        result = None
-        error = None
-        process_started_at = self.session_timer.start()
-        stage_durations = {}
-
-        com_initialized = False
-        try:
-            pythoncom.CoInitialize()
-            com_initialized = True
-
-            download_started_at = self.session_timer.start()
-
-            try:
-                downloaded_path = save_attachment(
-                    selected_attachment
-                )
-            except Exception as caught_error:
-                stage_durations["Download attachment"] = (
-                    self.session_timer.finish(
-                        "Download attachment",
-                        download_started_at,
-                        False,
-                        caught_error,
-                    )
-                )
-                raise
-            else:
-                stage_durations["Download attachment"] = (
-                    self.session_timer.finish(
-                        "Download attachment",
-                        download_started_at,
-                        True,
-                    )
-                )
-
-            self.post_ui_event(
-                self.update_progress,
-                45,
-                "Copying attachment contents...",
-            )
-
-            import_started_at = self.session_timer.start()
-
-            try:
-                result = import_attachment(
-                    source_path=downloaded_path,
-                    selected_queue=selected_queue,
-                    destination_workbook_name=destination_name,
-                    production_date=production_date,
-                    week_override=week_override,
-                    row_override=row_override,
-                )
-            except Exception as caught_error:
-                stage_durations["Copy into Excel"] = (
-                    self.session_timer.finish(
-                        "Copy into Excel",
-                        import_started_at,
-                        False,
-                        caught_error,
-                    )
-                )
-                raise
-            else:
-                stage_durations["Copy into Excel"] = (
-                    self.session_timer.finish(
-                        "Copy into Excel",
-                        import_started_at,
-                        True,
-                    )
-                )
-
-        except Exception as caught_error:
-            error = caught_error
-
-        finally:
-            if com_initialized:
-                pythoncom.CoUninitialize()
-
-        duration_seconds = self.session_timer.finish(
-            "Import Selected Attachment",
-            process_started_at,
-            error is None,
-            error,
-        )
-
-        self.post_ui_event(
-            self._finish_import,
-            result,
-            error,
-            duration_seconds,
-            stage_durations,
-        )
-
-    def _finish_import(
-        self,
-        result,
-        error,
-        duration_seconds: float,
-        stage_durations: dict[str, float],
-    ):
-        if error is not None:
-            self.notify_action_complete(
-                "Excel import failed",
-                "The selected report could not be imported.",
-            )
-            self.status_var.set(
-                f"Import failed after {duration_seconds:.2f} seconds."
-            )
-            self.show_error(
-                "Import failed",
-                error,
-            )
-            self.set_busy(False)
-            return
-
-        self.notify_action_complete(
-            "Excel import finished",
-            "The selected report has finished processing.",
-        )
-
-        self.update_progress(
-            100,
-            "Import completed successfully."
-        )
-
-        summary = (
-            "Import completed successfully.\n\n"
-            f"Workbook: {result['workbook']}\n"
-            f"Sheet: {result['sheet']}\n"
-            f"Rows imported: {result['rows']}\n"
-            f"Columns imported: {result['columns']}\n"
-            f"Import started at row: {result['first_row']}\n"
-            f"Destination rows: "
-            f"{result['first_row']} to "
-            f"{result['last_row']}\n"
-            f"Week: {result['week']} "
-            f"({result['week_source']})\n"
-            f"Day: {result['day']}\n"
-            f"Production Date: "
-            f"{result['production_date']}\n"
-            f"Download time: "
-            f"{stage_durations['Download attachment']:.2f} seconds\n"
-            f"Excel copy time: "
-            f"{stage_durations['Copy into Excel']:.2f} seconds\n"
-            f"Total import time: {duration_seconds:.2f} seconds"
-        )
-
-        self.status_var.set(summary)
-
-        self.set_busy(False)
-
-        messagebox.showinfo(
-            "Import Complete",
-            summary,
-        )
-
-    def close_application(self):
-        if self.action_active:
-            messagebox.showwarning(
-                "Action in progress",
-                "Please wait for the current action to finish "
-                "before closing the importer.",
-            )
-            return
-
-        self.closing = True
-        summary = self.session_timer.summary()
-        logger.info(summary)
-        messagebox.showinfo(
-            "Session Summary",
-            summary,
-        )
-        self.destroy()
-
-
-    def show_error(
-        self,
-        title: str,
-        error: Exception,
-    ):
-        traceback.print_exc()
-
-        error_message = (
-            f"{type(error).__name__}: "
-            f"{error}"
-        )
-
-        self.status_var.set(
-            error_message
-        )
-
-        messagebox.showerror(
-            title,
-            error_message,
-        )
-
-# ============================================================
 # START APPLICATION
 # ============================================================
 
@@ -3217,6 +1892,10 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    import sys
+
+    sys.modules.setdefault("outlook_dor_importer", sys.modules[__name__])
+    from outlook_dor_importer_ui import OutlookDORImporterApp
+
     application = OutlookDORImporterApp()
     application.mainloop()
-
