@@ -129,6 +129,7 @@ class OutlookDORImporterApp(tk.Tk):
         self.ui_events = queue.Queue()
         self.closing = False
         self.action_active = False
+        self.close_after_unhighlight = False
         self.cancel_event = threading.Event()
 
         self.protocol(
@@ -1874,6 +1875,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         error: Exception | None,
     ):
         if isinstance(error, ProcessCancelled):
+            self.close_after_unhighlight = False
             self.set_busy(False)
             self.set_activity("Unhighlight cancelled")
             self.status_var.set(
@@ -1882,6 +1884,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             return
 
         if error is not None:
+            self.close_after_unhighlight = False
             self.set_busy(False)
             self.set_activity("Unhighlight failed")
             self.show_error(
@@ -1896,6 +1899,10 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             "Removed highlighting from imported rows, DOR entries, and pivot values."
         )
         self.set_activity("Imported data unhighlighted", done=True)
+
+        if self.close_after_unhighlight:
+            self.close_after_unhighlight = False
+            self._finish_close_application()
 
     def _ranges_after_undo(
         self,
@@ -2246,6 +2253,15 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             )
             return
 
+        if self.imported_ranges:
+            self.close_after_unhighlight = True
+            self.set_activity("Removing imported-data highlights before closing...")
+            self.unhighlight_imported_data()
+            return
+
+        self._finish_close_application()
+
+    def _finish_close_application(self):
         self.closing = True
         summary = self.session_timer.summary()
         logger.info(summary)

@@ -2323,12 +2323,12 @@ def fill_metadata(
     production_date_range.NumberFormatLocal = "dd/mm/yyyy"
 
 
-def fill_inserted_row_formulas(
+def fill_imported_row_formulas(
     destination_sheet,
     first_row: int,
     row_count: int,
 ) -> None:
-    """Populates calculated columns for rows inserted at a chosen row."""
+    """Populates calculated columns for every imported row."""
     if row_count <= 0:
         return
 
@@ -2592,13 +2592,12 @@ def import_attachment(
                 production_date,
             )
 
-            if row_override is not None:
-                fill_inserted_row_formulas(
-                    destination_sheet,
-                    first_destination_row,
-                    len(source_rows),
-                )
-                check_cancelled(cancel_event)
+            fill_imported_row_formulas(
+                destination_sheet,
+                first_destination_row,
+                len(source_rows),
+            )
+            check_cancelled(cancel_event)
 
             if highlight_imported_data:
                 destination_sheet.Range(
