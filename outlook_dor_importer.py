@@ -69,7 +69,37 @@ OL_FOLDER_INBOX = 6
 XL_UP = -4162
 XL_TO_LEFT = -4159
 XL_DOWN = -4121
+XL_NONE = -4142
 IMPORTED_DATA_HIGHLIGHT_COLOR = 65535
+DOR_PASS_1_COLOR = 16247773
+DOR_PASS_2_COLOR = 14348258
+DOR_SOURCE_COLORS = {
+    "completed report pass 1": DOR_PASS_1_COLOR,
+    "completed report pass 2": DOR_PASS_2_COLOR,
+    "total elapsed time": 8696052,
+    "average report/hr": 14067636,
+    "completed reports": 14539150,
+    "late %": 13421812,
+    "ontime%": 11065270,
+    "auto vs manual manual": 10086143,
+    "manual reports average report/hr": 15323865,
+    "auto vs manual auto extraction": 14934224,
+    "auto extraction average report/hr": 13493756,
+}
+
+DOR_COLUMN_SOURCE_COLORS = {
+    3: DOR_SOURCE_COLORS["completed report pass 1"],
+    4: DOR_SOURCE_COLORS["completed report pass 2"],
+    5: DOR_SOURCE_COLORS["total elapsed time"],
+    6: DOR_SOURCE_COLORS["average report/hr"],
+    7: DOR_SOURCE_COLORS["completed reports"],
+    8: DOR_SOURCE_COLORS["late %"],
+    9: DOR_SOURCE_COLORS["ontime%"],
+    10: DOR_SOURCE_COLORS["auto vs manual manual"],
+    12: DOR_SOURCE_COLORS["manual reports average report/hr"],
+    13: DOR_SOURCE_COLORS["auto vs manual auto extraction"],
+    15: DOR_SOURCE_COLORS["auto extraction average report/hr"],
+}
 
 # ============================================================
 # PROCESS TIMING
@@ -1394,17 +1424,39 @@ def append_dor_import_record(
             dor_sheet,
             dor_row,
             1,
-            [[report_date, None, *summary_values]],
+            [[
+                report_date,
+                None,
+                *summary_values[:8],
+                None,
+                summary_values[8],
+                summary_values[9],
+                None,
+                summary_values[10],
+            ]],
         )
         dor_sheet.Cells(
             dor_row,
             1,
-        ).NumberFormat = "mm/dd/yyyy"
+        ).NumberFormat = "dddd, mmmm d, yyyy"
+        dor_sheet.Cells(
+            dor_row,
+            11,
+        ).FormulaR1C1 = "=IFERROR(RC[-1]/RC[-7],0)"
+        dor_sheet.Cells(
+            dor_row,
+            14,
+        ).FormulaR1C1 = "=IFERROR(RC[-1]/RC[-10],0)"
         if highlight_imported_data:
             dor_sheet.Range(
                 dor_sheet.Cells(dor_row, 1),
-                dor_sheet.Cells(dor_row, 4),
+                dor_sheet.Cells(dor_row, 15),
             ).Interior.Color = IMPORTED_DATA_HIGHLIGHT_COLOR
+        for column_number, source_color in DOR_COLUMN_SOURCE_COLORS.items():
+            dor_sheet.Cells(
+                dor_row,
+                column_number,
+            ).Interior.Color = source_color
     except Exception:
         if row_inserted:
             dor_sheet.Rows("6:6").Delete(
@@ -1413,11 +1465,639 @@ def append_dor_import_record(
         else:
             dor_sheet.Range(
                 dor_sheet.Cells(dor_row, 1),
-                dor_sheet.Cells(dor_row, 4),
+                dor_sheet.Cells(dor_row, 15),
             ).ClearContents()
         raise
 
     return dor_row
+
+
+def resolve_imported_highlight_range(
+    worksheet,
+    imported_range: dict,
+    cancel_event: threading.Event | None = None,
+) -> tuple[int, int, int, int]:
+    pivot_date = imported_range.get("pivot_source_date")
+    if not pivot_date:
+        return (
+            imported_range["first_row"],
+            imported_range["last_row"],
+            imported_range["first_column"],
+            imported_range["last_column"],
+        )
+
+    _, source_ranges = get_dor_summary_values(
+        worksheet,
+        date.fromisoformat(pivot_date),
+        cancel_event,
+    )
+    source_field = imported_range["source_field"]
+    current_range = next(
+        (
+            source_range
+            for source_range in source_ranges
+            if source_range["source_field"] == source_field
+        ),
+        None,
+    )
+    if current_range is None:
+        raise RuntimeError(
+            f'Could not relocate pivot source "{source_field}" for '
+            f"{pivot_date}."
+        )
+
+    return (
+        current_range["first_row"],
+        current_range["last_row"],
+        current_range["first_column"],
+        current_range["last_column"],
+    )
+
+
+def clear_imported_data_highlight(
+    imported_ranges: list[dict],
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Clears fill formatting from imported ranges and saves their workbooks."""
+    if not imported_ranges:
+        return
+
+    check_cancelled(cancel_event)
+    excel = win32com.client.Dispatch("Excel.Application")
+    excel.Visible = True
+    workbooks = {}
+    changed_workbooks = {}
+
+    try:
+        for imported_range in imported_ranges:
+            check_cancelled(cancel_event)
+            workbook_name = imported_range["workbook"]
+            workbook_key = workbook_stem(workbook_name)
+            workbook = workbooks.get(workbook_key)
+            if workbook is None:
+                workbook = find_open_workbook(excel, workbook_name)
+                workbooks[workbook_key] = workbook
+
+            worksheet = find_sheet(
+                workbook,
+                imported_range["sheet"],
+            )
+            (
+                first_row,
+                last_row,
+                first_column,
+                last_column,
+            ) = resolve_imported_highlight_range(
+                worksheet,
+                imported_range,
+                cancel_event,
+            )
+
+            worksheet.Range(
+                worksheet.Cells(
+                    first_row,
+                    first_column,
+                ),
+                worksheet.Cells(
+                    last_row,
+                    last_column,
+                ),
+            ).Interior.Pattern = XL_NONE
+            changed_workbooks[workbook_key] = workbook
+
+        check_cancelled(cancel_event)
+    except ProcessCancelled:
+        for workbook in changed_workbooks.values():
+            workbook.Save()
+        raise
+
+    for workbook in changed_workbooks.values():
+        workbook.Save()
+
+
+def highlight_imported_data_ranges(
+    imported_ranges: list[dict],
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Applies import and source-specific colors to tracked ranges."""
+    if not imported_ranges:
+        return
+
+    check_cancelled(cancel_event)
+    excel = win32com.client.Dispatch("Excel.Application")
+    excel.Visible = True
+    workbooks = {}
+    changed_workbooks = {}
+
+    try:
+        for imported_range in imported_ranges:
+            check_cancelled(cancel_event)
+            workbook_name = imported_range["workbook"]
+            workbook_key = workbook_stem(workbook_name)
+            workbook = workbooks.get(workbook_key)
+            if workbook is None:
+                workbook = find_open_workbook(excel, workbook_name)
+                workbooks[workbook_key] = workbook
+
+            worksheet = find_sheet(
+                workbook,
+                imported_range["sheet"],
+            )
+            (
+                first_row,
+                last_row,
+                first_column,
+                last_column,
+            ) = resolve_imported_highlight_range(
+                worksheet,
+                imported_range,
+                cancel_event,
+            )
+
+            worksheet.Range(
+                worksheet.Cells(first_row, first_column),
+                worksheet.Cells(last_row, last_column),
+            ).Interior.Color = IMPORTED_DATA_HIGHLIGHT_COLOR
+
+            range_kind = imported_range.get("kind")
+            if range_kind == "dor":
+                for column_number, source_color in DOR_COLUMN_SOURCE_COLORS.items():
+                    worksheet.Cells(
+                        first_row,
+                        column_number,
+                    ).Interior.Color = source_color
+            elif range_kind == "pivot":
+                worksheet.Cells(
+                    first_row,
+                    first_column,
+                ).Interior.Color = imported_range["source_color"]
+
+            changed_workbooks[workbook_key] = workbook
+
+        check_cancelled(cancel_event)
+    except ProcessCancelled:
+        for workbook in changed_workbooks.values():
+            workbook.Save()
+        raise
+
+    for workbook in changed_workbooks.values():
+        workbook.Save()
+
+
+def refresh_destination_workbook_data(
+    excel,
+    destination_workbook,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Refreshes workbook connections and waits for asynchronous queries."""
+    check_cancelled(cancel_event)
+    destination_workbook.RefreshAll()
+    excel.CalculateUntilAsyncQueriesDone()
+    check_cancelled(cancel_event)
+
+
+def undo_imported_data(
+    import_result: dict,
+    raw_row_segments: list[tuple[int, int]],
+    raw_rows_inserted: bool,
+    dor_row: int,
+    dor_row_inserted: bool,
+    ranges_to_remove: list[dict],
+    remaining_ranges: list[dict],
+    rehighlight_remaining: bool,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    """Removes one completed import from raw data and DOR, then refreshes pivots."""
+    check_cancelled(cancel_event)
+    excel = win32com.client.Dispatch("Excel.Application")
+    excel.Visible = True
+    workbook = find_open_workbook(
+        excel,
+        import_result["workbook"],
+    )
+    raw_sheet = find_sheet(
+        workbook,
+        import_result["sheet"],
+    )
+    dor_sheet = find_sheet(workbook, "DOR")
+
+    for imported_range in ranges_to_remove:
+        if imported_range.get("kind") == "pivot" and not imported_range.get(
+            "is_highlighted",
+            False,
+        ):
+            continue
+        pivot_sheet = find_sheet(
+            workbook,
+            imported_range["sheet"],
+        )
+        first_row, last_row, first_column, last_column = resolve_imported_highlight_range(
+            pivot_sheet,
+            imported_range,
+            cancel_event,
+        )
+        pivot_sheet.Range(
+            pivot_sheet.Cells(first_row, first_column),
+            pivot_sheet.Cells(last_row, last_column),
+        ).Interior.Pattern = XL_NONE
+
+    raw_ranges = [
+        imported_range
+        for imported_range in ranges_to_remove
+        if imported_range.get("kind") == "raw"
+    ]
+    if raw_rows_inserted:
+        for first_row, last_row in sorted(raw_row_segments, reverse=True):
+            raw_sheet.Rows(
+                f"{first_row}:{last_row}"
+            ).Delete(
+                Shift=XL_UP,
+            )
+    else:
+        for raw_range in raw_ranges:
+            raw_data_range = raw_sheet.Range(
+                raw_sheet.Cells(
+                    raw_range["first_row"],
+                    raw_range["first_column"],
+                ),
+                raw_sheet.Cells(
+                    raw_range["last_row"],
+                    raw_range["last_column"],
+                ),
+            )
+            raw_data_range.ClearContents()
+            raw_data_range.Interior.Pattern = XL_NONE
+
+    dor_ranges = [
+        imported_range
+        for imported_range in ranges_to_remove
+        if imported_range.get("kind") == "dor"
+    ]
+    if dor_row_inserted:
+        dor_sheet.Rows(
+            f"{dor_row}:{dor_row}"
+        ).Delete(
+            Shift=XL_UP,
+        )
+    else:
+        for dor_range in dor_ranges:
+            dor_data_range = dor_sheet.Range(
+                dor_sheet.Cells(
+                    dor_range["first_row"],
+                    dor_range["first_column"],
+                ),
+                dor_sheet.Cells(
+                    dor_range["last_row"],
+                    dor_range["last_column"],
+                ),
+            )
+            dor_data_range.ClearContents()
+            dor_data_range.Interior.Pattern = XL_NONE
+
+    try:
+        workbook.RefreshAll()
+        excel.CalculateUntilAsyncQueriesDone()
+    except Exception as error:
+        logger.warning(
+            "Could not refresh workbook data after undo: %s",
+            error,
+        )
+
+    if rehighlight_remaining and remaining_ranges:
+        highlight_imported_data_ranges(
+            remaining_ranges,
+            cancel_event,
+        )
+
+    workbook.Save()
+
+
+def get_dor_summary_values(
+    summary_sheet,
+    production_date: date,
+    cancel_event: threading.Event | None = None,
+) -> tuple[tuple, list[dict]]:
+    """Looks up DOR metrics and their source cells by date."""
+    check_cancelled(cancel_event)
+    used_range = summary_sheet.UsedRange
+    rows = range_to_rows(used_range.Value)
+    check_cancelled(cancel_event)
+    first_excel_row = int(used_range.Row)
+    first_excel_column = int(used_range.Column)
+
+    section_titles = {
+        "auto vs manual",
+        "total completed & average per hour",
+        "past 12-hr tat",
+        "manual reports",
+        "auto extraction",
+    }
+    sections = {}
+
+    for row_index, row_values in enumerate(rows):
+        for column_index, value in enumerate(row_values):
+            normalized_value = normalize(value)
+            if normalized_value in section_titles and normalized_value not in sections:
+                following_titles = [
+                    other_column
+                    for other_column, other_value in enumerate(row_values)
+                    if other_column > column_index
+                    and normalize(other_value) in section_titles
+                ]
+                sections[normalized_value] = (
+                    row_index,
+                    column_index,
+                    min(following_titles) - 1
+                    if following_titles
+                    else len(row_values) - 1,
+                )
+
+    def find_date_header(section):
+        title_row, first_column, last_column = section
+        for row_index in range(title_row + 1, min(title_row + 15, len(rows))):
+            for column_index in range(first_column, min(last_column + 1, len(rows[row_index]))):
+                header_text = normalize(rows[row_index][column_index])
+                if header_text == "date":
+                    return row_index, column_index
+                if (
+                    column_index == first_column
+                    and header_text in {"state", "row labels"}
+                    and any(
+                        to_python_date(rows[data_row][column_index])
+                        is not None
+                        for data_row in range(
+                            row_index + 1,
+                            min(row_index + 4, len(rows)),
+                        )
+                        if column_index < len(rows[data_row])
+                    )
+                ):
+                    return row_index, column_index
+        return None
+
+    date_headers = {
+        section_name: find_date_header(section)
+        for section_name, section in sections.items()
+    }
+
+    def find_data_row(section_name, date_header):
+        title_row, _first_column, _last_column = sections[section_name]
+        header_row, date_column = date_header
+        timezone_match = None
+
+        for row_index in range(header_row + 1, len(rows)):
+            check_cancelled(cancel_event)
+            if date_column >= len(rows[row_index]):
+                continue
+            value = rows[row_index][date_column]
+            if to_python_date(value) == production_date:
+                return row_index
+            if (
+                timezone_match is None
+                and isinstance(value, datetime)
+                and value.tzinfo is not None
+                and value.astimezone().date() == production_date
+            ):
+                timezone_match = row_index
+
+        if timezone_match is not None:
+            return timezone_match
+
+        raise RuntimeError(
+            "Production date "
+            f"{production_date.strftime('%m/%d/%Y')} was not found in "
+            f'the "{section_name}" table on "{summary_sheet.Name}".'
+        )
+
+    def find_direct_column(section, target_header, header_row):
+        title_row, first_column, last_column = section
+        for row_index in range(title_row + 1, header_row + 1):
+            for column_index in range(
+                first_column,
+                min(last_column + 1, len(rows[row_index])),
+            ):
+                if normalize(rows[row_index][column_index]) == target_header:
+                    return column_index
+        raise RuntimeError(
+            f'Could not find "{target_header}" in the '
+            f'"{summary_sheet.Name}" summary table.'
+        )
+
+    def find_pass_column(section, pass_name, date_header):
+        title_row, first_column, last_column = section
+        date_header_row, _date_column = date_header
+
+        for row_index in range(title_row + 1, date_header_row):
+            parent_row = rows[row_index]
+            for parent_column in range(
+                first_column,
+                min(last_column + 1, len(parent_row)),
+            ):
+                if normalize(parent_row[parent_column]) != "completed report":
+                    continue
+
+                group_end = next(
+                    (
+                        other_column
+                        for other_column in range(parent_column + 1, len(parent_row))
+                        if has_value(parent_row[other_column])
+                    ),
+                    last_column + 1,
+                )
+                for header_row_index in range(row_index + 1, date_header_row + 1):
+                    header_row = rows[header_row_index]
+                    for column_index in range(
+                        parent_column,
+                        min(group_end, len(header_row)),
+                    ):
+                        if normalize(header_row[column_index]) == pass_name:
+                            return column_index
+
+        raise RuntimeError(
+            f'Could not find "Completed Report {pass_name}" in '
+            f'"{summary_sheet.Name}".'
+        )
+
+    main_section = sections.get("total completed & average per hour")
+    tat_section = sections.get("past 12-hr tat")
+    auto_manual_section = sections.get("auto vs manual")
+    manual_reports_section = sections.get("manual reports")
+    auto_extraction_section = sections.get("auto extraction")
+    if any(
+        section is None
+        for section in (
+            main_section,
+            tat_section,
+            auto_manual_section,
+            manual_reports_section,
+            auto_extraction_section,
+        )
+    ):
+        raise RuntimeError(
+            f'Could not find the DOR summary sections on "{summary_sheet.Name}".'
+        )
+
+    main_date_header = date_headers["total completed & average per hour"]
+    tat_date_header = date_headers["past 12-hr tat"]
+    auto_manual_date_header = date_headers["auto vs manual"]
+    manual_reports_date_header = date_headers["manual reports"]
+    auto_extraction_date_header = date_headers["auto extraction"]
+    if any(
+        date_header is None
+        for date_header in (
+            main_date_header,
+            tat_date_header,
+            auto_manual_date_header,
+            manual_reports_date_header,
+            auto_extraction_date_header,
+        )
+    ):
+        raise RuntimeError(
+            f'Could not find date columns in the DOR summary tables on "{summary_sheet.Name}".'
+        )
+
+    main_data_row = find_data_row(
+        "total completed & average per hour",
+        main_date_header,
+    )
+    tat_data_row = find_data_row(
+        "past 12-hr tat",
+        tat_date_header,
+    )
+    auto_manual_data_row = find_data_row(
+        "auto vs manual",
+        auto_manual_date_header,
+    )
+    manual_reports_data_row = find_data_row(
+        "manual reports",
+        manual_reports_date_header,
+    )
+    auto_extraction_data_row = find_data_row(
+        "auto extraction",
+        auto_extraction_date_header,
+    )
+
+    metric_columns = [
+        (
+            "completed report pass 1",
+            find_pass_column(main_section, "pass 1", main_date_header),
+            main_data_row,
+        ),
+        (
+            "completed report pass 2",
+            find_pass_column(main_section, "pass 2", main_date_header),
+            main_data_row,
+        ),
+        (
+            "total elapsed time",
+            find_direct_column(
+                main_section,
+                "total elapsed time",
+                main_date_header[0],
+            ),
+            main_data_row,
+        ),
+        (
+            "average report/hr",
+            find_direct_column(
+                main_section,
+                "average report/hr",
+                main_date_header[0],
+            ),
+            main_data_row,
+        ),
+        (
+            "completed reports",
+            find_direct_column(
+                tat_section,
+                "completed reports",
+                tat_date_header[0],
+            ),
+            tat_data_row,
+        ),
+        (
+            "late %",
+            find_direct_column(
+                tat_section,
+                "late %",
+                tat_date_header[0],
+            ),
+            tat_data_row,
+        ),
+        (
+            "ontime%",
+            find_direct_column(
+                tat_section,
+                "ontime%",
+                tat_date_header[0],
+            ),
+            tat_data_row,
+        ),
+        (
+            "auto vs manual manual",
+            find_direct_column(
+                auto_manual_section,
+                "manual",
+                auto_manual_date_header[0],
+            ),
+            auto_manual_data_row,
+        ),
+        (
+            "manual reports average report/hr",
+            find_direct_column(
+                manual_reports_section,
+                "average report/hr",
+                manual_reports_date_header[0],
+            ),
+            manual_reports_data_row,
+        ),
+        (
+            "auto vs manual auto extraction",
+            find_direct_column(
+                auto_manual_section,
+                "auto extraction",
+                auto_manual_date_header[0],
+            ),
+            auto_manual_data_row,
+        ),
+        (
+            "auto extraction average report/hr",
+            find_direct_column(
+                auto_extraction_section,
+                "average report/hr",
+                auto_extraction_date_header[0],
+            ),
+            auto_extraction_data_row,
+        ),
+    ]
+
+    summary_values = []
+    source_ranges = []
+    for source_field, column_index, row_index in metric_columns:
+        if column_index >= len(rows[row_index]):
+            raise RuntimeError(
+                f'No value for "{source_field}" was found for '
+                f"{production_date.strftime('%m/%d/%Y')}."
+            )
+
+        summary_values.append(rows[row_index][column_index])
+        excel_row = first_excel_row + row_index
+        excel_column = first_excel_column + column_index
+        source_ranges.append(
+            {
+                "sheet": str(summary_sheet.Name),
+                "first_row": excel_row,
+                "last_row": excel_row,
+                "first_column": excel_column,
+                "last_column": excel_column,
+                "kind": "pivot",
+                "source_field": source_field,
+                "source_color": DOR_SOURCE_COLORS[source_field],
+                "pivot_source_date": production_date.isoformat(),
+            }
+        )
+
+    return tuple(summary_values), source_ranges
 
 
 def find_existing_week(
@@ -1595,10 +2275,9 @@ def fill_metadata(
         "%A"
     )
 
-    excel_date_value = datetime.combine(
-        production_date,
-        datetime.min.time(),
-    )
+    excel_date_serial = (
+        production_date - date(1899, 12, 30)
+    ).days
 
     week_range = destination_sheet.Range(
         destination_sheet.Cells(
@@ -1638,13 +2317,10 @@ def fill_metadata(
     week_range.Value = week_value
     day_range.Value = day_value
 
-    production_date_range.Value = (
-        excel_date_value
-    )
+    production_date_range.Value2 = excel_date_serial
 
-    production_date_range.NumberFormat = (
-        "mm/dd/yyyy"
-    )
+    production_date_range.NumberFormat = "dd/mm/yyyy"
+    production_date_range.NumberFormatLocal = "dd/mm/yyyy"
 
 
 def fill_inserted_row_formulas(
@@ -1767,10 +2443,6 @@ def import_attachment(
     summary_sheet = find_sheet(
         destination_workbook,
         "Summary by date (All states)",
-    )
-    summary_values = (
-        summary_sheet.Cells(10, 8).Value,
-        summary_sheet.Cells(10, 9).Value,
     )
 
     source_workbook = None
@@ -1953,6 +2625,32 @@ def import_attachment(
                 )
             raise
 
+        refresh_destination_workbook_data(
+            excel,
+            destination_workbook,
+            cancel_event,
+        )
+
+        summary_values, pivot_source_ranges = get_dor_summary_values(
+            summary_sheet,
+            production_date,
+            cancel_event,
+        )
+        for pivot_source_range in pivot_source_ranges:
+            pivot_source_range["workbook"] = str(
+                destination_workbook.Name
+            )
+            pivot_source_range["is_highlighted"] = (
+                highlight_imported_data
+            )
+
+        if highlight_imported_data:
+            for pivot_source_range in pivot_source_ranges:
+                summary_sheet.Cells(
+                    pivot_source_range["first_row"],
+                    pivot_source_range["first_column"],
+                ).Interior.Color = pivot_source_range["source_color"]
+
         dor_row = append_dor_import_record(
             dor_sheet,
             production_date,
@@ -1961,6 +2659,29 @@ def import_attachment(
         )
 
         destination_workbook.Save()
+
+        highlight_ranges = [
+            {
+                "workbook": str(destination_workbook.Name),
+                "sheet": str(destination_sheet.Name),
+                "kind": "raw",
+                "first_row": first_destination_row,
+                "last_row": first_destination_row + len(source_rows) - 1,
+                "first_column": min(imported_columns),
+                "last_column": max(imported_columns),
+            },
+            {
+                "workbook": str(destination_workbook.Name),
+                "sheet": str(dor_sheet.Name),
+                "kind": "dor",
+                "first_row": dor_row,
+                "last_row": dor_row,
+                "first_column": 1,
+                "last_column": 15,
+            },
+        ]
+
+        highlight_ranges.extend(pivot_source_ranges)
 
         return {
             "rows": len(source_rows),
@@ -1990,6 +2711,10 @@ def import_attachment(
             "workbook": str(
                 destination_workbook.Name
             ),
+            "dor_row_inserted": dor_row == 6,
+            "raw_rows_inserted": row_override is not None,
+            "highlight_imported_data": highlight_imported_data,
+            "highlight_ranges": highlight_ranges,
         }
 
     finally:

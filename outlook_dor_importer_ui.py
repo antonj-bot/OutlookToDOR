@@ -20,15 +20,18 @@ from outlook_dor_importer import (
     ProcessCancelled,
     SessionTimer,
     check_cancelled,
+    clear_imported_data_highlight,
     extract_date_from_filename,
     filter_outlook_folder_choices,
     get_outlook_namespace,
+    highlight_imported_data_ranges,
     import_attachment,
     list_excel_attachments,
     list_outlook_folder_paths,
     logger,
     parse_date,
     save_attachment,
+    undo_imported_data,
 )
 
 FLASHW_TRAY = 0x00000002
@@ -65,6 +68,9 @@ class OutlookDORImporterApp(tk.Tk):
         self.attachments: list[
             AttachmentInfo
         ] = []
+        self.imported_ranges: list[dict] = []
+        self.import_records: list[dict] = []
+        self.imported_data_highlighted = False
 
         self.queue_var = tk.StringVar(
             value="Ecrash"
@@ -787,11 +793,33 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             variable=self.highlight_imported_var,
         )
 
+        self.highlight_toggle_button = ttk.Button(
+            action_frame,
+            text="Rehighlight Imported Data",
+            command=self.toggle_imported_data_highlight,
+            state="disabled",
+        )
+
+        self.undo_import_button = ttk.Button(
+            action_frame,
+            text="Undo Last Import",
+            command=self.undo_last_import,
+            state="disabled",
+        )
+
         self.highlight_imported_checkbutton.pack(
             side="left",
             padx=(0, 12),
         )
         self.import_button.pack(
+            side="left",
+            padx=(0, 6),
+        )
+        self.highlight_toggle_button.pack(
+            side="left",
+            padx=(0, 6),
+        )
+        self.undo_import_button.pack(
             side="left",
         )
         
@@ -886,6 +914,12 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             self.import_button.configure(
                 state="disabled"
             )
+            self.highlight_toggle_button.configure(
+                state="disabled"
+            )
+            self.undo_import_button.configure(
+                state="disabled"
+            )
             self.refresh_folders_button.configure(
                 state="disabled"
             )
@@ -893,9 +927,6 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                 state="disabled"
             )
             self.latest_button.configure(
-                state="disabled"
-            )
-            self.highlight_imported_checkbutton.configure(
                 state="disabled"
             )
             self.cancel_button.configure(
@@ -909,6 +940,17 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 
             self.import_button.configure(
                 state="normal"
+            )
+            self.highlight_toggle_button.configure(
+                text=(
+                    "Unhighlight Imported Data"
+                    if self.imported_data_highlighted
+                    else "Rehighlight Imported Data"
+                ),
+                state=("normal" if self.imported_ranges else "disabled"),
+            )
+            self.undo_import_button.configure(
+                state=("normal" if self.import_records else "disabled")
             )
             self.refresh_folders_button.configure(
                 state="normal"
@@ -1714,7 +1756,382 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             error,
             duration_seconds,
             stage_durations,
+            row_override,
         )
+
+    def toggle_imported_data_highlight(self):
+        if self.imported_data_highlighted:
+            self.unhighlight_imported_data()
+        else:
+            self.highlight_imported_data()
+
+    def highlight_imported_data(self):
+        if (
+            self.action_active
+            or not self.imported_ranges
+            or self.imported_data_highlighted
+        ):
+            return
+
+        self.set_busy(True)
+        self.set_activity("Highlighting imported data...")
+        threading.Thread(
+            target=self._highlight_imported_data_worker,
+            args=([dict(item) for item in self.imported_ranges],),
+            daemon=True,
+        ).start()
+
+    def _highlight_imported_data_worker(
+        self,
+        imported_ranges: list[dict],
+    ):
+        error = None
+        com_initialized = False
+        try:
+            pythoncom.CoInitialize()
+            com_initialized = True
+            highlight_imported_data_ranges(
+                imported_ranges,
+                self.cancel_event,
+            )
+        except Exception as caught_error:
+            error = caught_error
+        finally:
+            if com_initialized:
+                pythoncom.CoUninitialize()
+
+        self.post_ui_event(
+            self._finish_highlight_imported_data,
+            error,
+        )
+
+    def _finish_highlight_imported_data(
+        self,
+        error: Exception | None,
+    ):
+        if isinstance(error, ProcessCancelled):
+            self.set_busy(False)
+            self.set_activity("Highlight cancelled")
+            self.status_var.set(
+                "Highlight cancelled. You can run it again to finish."
+            )
+            return
+
+        if error is not None:
+            self.set_busy(False)
+            self.set_activity("Highlight failed")
+            self.show_error(
+                "Could not highlight imported data",
+                error,
+            )
+            return
+
+        self.imported_data_highlighted = True
+        self.set_busy(False)
+        self.status_var.set(
+            "Highlighted imported rows, DOR entries, and pivot values."
+        )
+        self.set_activity("Imported data highlighted", done=True)
+
+    def unhighlight_imported_data(self):
+        if self.action_active or not self.imported_ranges:
+            return
+
+        self.set_busy(True)
+        self.set_activity("Removing highlight from imported data...")
+        threading.Thread(
+            target=self._unhighlight_imported_data_worker,
+            args=([dict(item) for item in self.imported_ranges],),
+            daemon=True,
+        ).start()
+
+    def _unhighlight_imported_data_worker(
+        self,
+        imported_ranges: list[dict],
+    ):
+        error = None
+        com_initialized = False
+        try:
+            pythoncom.CoInitialize()
+            com_initialized = True
+            clear_imported_data_highlight(
+                imported_ranges,
+                self.cancel_event,
+            )
+        except Exception as caught_error:
+            error = caught_error
+        finally:
+            if com_initialized:
+                pythoncom.CoUninitialize()
+
+        self.post_ui_event(
+            self._finish_unhighlight_imported_data,
+            error,
+        )
+
+    def _finish_unhighlight_imported_data(
+        self,
+        error: Exception | None,
+    ):
+        if isinstance(error, ProcessCancelled):
+            self.set_busy(False)
+            self.set_activity("Unhighlight cancelled")
+            self.status_var.set(
+                "Unhighlight cancelled. You can run it again to finish."
+            )
+            return
+
+        if error is not None:
+            self.set_busy(False)
+            self.set_activity("Unhighlight failed")
+            self.show_error(
+                "Could not unhighlight imported data",
+                error,
+            )
+            return
+
+        self.imported_data_highlighted = False
+        self.set_busy(False)
+        self.status_var.set(
+            "Removed highlighting from imported rows, DOR entries, and pivot values."
+        )
+        self.set_activity("Imported data unhighlighted", done=True)
+
+    def _ranges_after_undo(
+        self,
+        import_record: dict,
+    ) -> tuple[list[dict], list[dict]]:
+        import_result = import_record["result"]
+        import_id = import_record["import_id"]
+        ranges_to_remove = []
+        remaining_ranges = []
+
+        for imported_range in self.imported_ranges:
+            if imported_range.get("import_id") == import_id:
+                ranges_to_remove.append(dict(imported_range))
+            else:
+                remaining_ranges.append(dict(imported_range))
+
+        if import_record["row_override"] is not None:
+            first_inserted_row = import_result["first_row"]
+            first_row_after_insert = (
+                first_inserted_row + import_result["rows"]
+            )
+
+            for imported_range in remaining_ranges:
+                if (
+                    imported_range.get("kind") == "raw"
+                    and imported_range["workbook"].casefold()
+                    == import_result["workbook"].casefold()
+                    and imported_range["sheet"].casefold()
+                    == import_result["sheet"].casefold()
+                    and imported_range["first_row"] >= first_row_after_insert
+                ):
+                    imported_range["first_row"] -= import_result["rows"]
+                    imported_range["last_row"] -= import_result["rows"]
+
+        if import_record["dor_row_inserted"]:
+            for imported_range in remaining_ranges:
+                if (
+                    imported_range.get("kind") == "dor"
+                    and imported_range["workbook"].casefold()
+                    == import_result["workbook"].casefold()
+                    and imported_range["first_row"] > import_record["dor_row"]
+                ):
+                    imported_range["first_row"] -= 1
+                    imported_range["last_row"] -= 1
+
+        return ranges_to_remove, remaining_ranges
+
+    def undo_last_import(self):
+        if self.action_active or not self.import_records:
+            return
+
+        import_record = self.import_records[-1]
+        ranges_to_remove, remaining_ranges = self._ranges_after_undo(
+            import_record
+        )
+        rehighlight_remaining = (
+            self.imported_data_highlighted
+            and bool(remaining_ranges)
+        )
+
+        self.set_busy(True)
+        self.set_activity("Undoing the last import...")
+        threading.Thread(
+            target=self._undo_last_import_worker,
+            args=(
+                import_record,
+                ranges_to_remove,
+                remaining_ranges,
+                rehighlight_remaining,
+            ),
+            daemon=True,
+        ).start()
+
+    def _undo_last_import_worker(
+        self,
+        import_record: dict,
+        ranges_to_remove: list[dict],
+        remaining_ranges: list[dict],
+        rehighlight_remaining: bool,
+    ):
+        error = None
+        com_initialized = False
+
+        try:
+            pythoncom.CoInitialize()
+            com_initialized = True
+            undo_imported_data(
+                import_record["result"],
+                import_record["raw_row_segments"],
+                import_record["row_override"] is not None,
+                import_record["dor_row"],
+                import_record["dor_row_inserted"],
+                ranges_to_remove,
+                remaining_ranges,
+                rehighlight_remaining,
+                self.cancel_event,
+            )
+        except Exception as caught_error:
+            error = caught_error
+        finally:
+            if com_initialized:
+                pythoncom.CoUninitialize()
+
+        self.post_ui_event(
+            self._finish_undo_last_import,
+            import_record,
+            remaining_ranges,
+            rehighlight_remaining,
+            error,
+        )
+
+    def _finish_undo_last_import(
+        self,
+        import_record: dict,
+        remaining_ranges: list[dict],
+        rehighlight_remaining: bool,
+        error: Exception | None,
+    ):
+        if error is not None:
+            self.set_busy(False)
+            if isinstance(error, ProcessCancelled):
+                self.set_activity("Undo cancelled")
+                self.status_var.set("Undo cancelled before data was removed.")
+            else:
+                self.set_activity("Undo failed")
+                self.show_error("Could not undo the last import", error)
+            return
+
+        self.imported_ranges = remaining_ranges
+        if self.import_records and self.import_records[-1]["import_id"] == import_record["import_id"]:
+            self.import_records.pop()
+        self.imported_data_highlighted = rehighlight_remaining
+        self.set_busy(False)
+        self.status_var.set(
+            "Undid the last import and refreshed the summary pivots."
+        )
+        self.set_activity("Last import undone", done=True)
+
+    def _record_imported_range(
+        self,
+        result: dict,
+        row_override: int | None,
+    ):
+        ranges_to_add = [
+            dict(imported_range)
+            for imported_range in result["highlight_ranges"]
+        ]
+        for imported_range in ranges_to_add:
+            imported_range["import_id"] = result["import_id"]
+        row_insertions = []
+
+        if row_override is not None and result["rows"] > 0:
+            row_insertions.append(
+                (result["sheet"], row_override, result["rows"])
+            )
+
+        if result["dor_row_inserted"]:
+            dor_range = ranges_to_add[1]
+            row_insertions.append(
+                (dor_range["sheet"], result["dor_row"], 1)
+            )
+
+        for sheet_name, insert_row, inserted_row_count in row_insertions:
+            updated_ranges = []
+            for imported_range in self.imported_ranges:
+                same_sheet = (
+                    imported_range["workbook"].casefold()
+                    == result["workbook"].casefold()
+                    and imported_range["sheet"].casefold()
+                    == sheet_name.casefold()
+                )
+
+                if (
+                    not same_sheet
+                    or imported_range["last_row"] < insert_row
+                ):
+                    updated_ranges.append(imported_range)
+                elif imported_range["first_row"] >= insert_row:
+                    shifted_range = dict(imported_range)
+                    shifted_range["first_row"] += inserted_row_count
+                    shifted_range["last_row"] += inserted_row_count
+                    updated_ranges.append(shifted_range)
+                else:
+                    before_insert = dict(imported_range)
+                    before_insert["last_row"] = insert_row - 1
+                    updated_ranges.append(before_insert)
+
+                    after_insert = dict(imported_range)
+                    after_insert["first_row"] = (
+                        insert_row + inserted_row_count
+                    )
+                    after_insert["last_row"] += inserted_row_count
+                    updated_ranges.append(after_insert)
+
+            self.imported_ranges = updated_ranges
+
+            for import_record in self.import_records:
+                previous_result = import_record["result"]
+                if (
+                    previous_result["workbook"].casefold()
+                    != result["workbook"].casefold()
+                ):
+                    continue
+
+                if previous_result["sheet"].casefold() == sheet_name.casefold():
+                    shifted_segments = []
+                    for first_row, last_row in import_record["raw_row_segments"]:
+                        if last_row < insert_row:
+                            shifted_segments.append((first_row, last_row))
+                        elif first_row >= insert_row:
+                            shifted_segments.append(
+                                (
+                                    first_row + inserted_row_count,
+                                    last_row + inserted_row_count,
+                                )
+                            )
+                        else:
+                            shifted_segments.append(
+                                (first_row, insert_row - 1)
+                            )
+                            shifted_segments.append(
+                                (
+                                    insert_row + inserted_row_count,
+                                    last_row + inserted_row_count,
+                                )
+                            )
+                    import_record["raw_row_segments"] = shifted_segments
+
+                elif (
+                    import_record["dor_sheet"].casefold()
+                    == sheet_name.casefold()
+                    and import_record["dor_row"] >= insert_row
+                ):
+                    import_record["dor_row"] += inserted_row_count
+
+        self.imported_ranges.extend(ranges_to_add)
 
     def _finish_import(
         self,
@@ -1722,6 +2139,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         error,
         duration_seconds: float,
         stage_durations: dict[str, float],
+        row_override: int | None,
     ):
         if isinstance(error, ProcessCancelled):
             self.set_activity("Import cancelled")
@@ -1746,6 +2164,29 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             )
             self.set_busy(False)
             return
+
+        result["import_id"] = id(result)
+        self._record_imported_range(
+            result,
+            row_override,
+        )
+        self.import_records.append(
+            {
+                "import_id": result["import_id"],
+                "result": result,
+                "row_override": row_override,
+                "raw_row_segments": [
+                    (result["first_row"], result["last_row"])
+                ],
+                "dor_sheet": "DOR",
+                "dor_row": result["dor_row"],
+                "dor_row_inserted": result["dor_row_inserted"],
+            }
+        )
+        self.imported_data_highlighted = (
+            self.imported_data_highlighted
+            or result["highlight_imported_data"]
+        )
 
         self.notify_action_complete(
             "Excel import finished",
