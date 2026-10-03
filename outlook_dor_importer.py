@@ -69,12 +69,22 @@ OL_FOLDER_INBOX = 6
 XL_UP = -4162
 XL_TO_LEFT = -4159
 XL_DOWN = -4121
+IMPORTED_DATA_HIGHLIGHT_COLOR = 65535
 
 # ============================================================
 # PROCESS TIMING
 # ============================================================
 
 logger = logging.getLogger("outlook_dor_importer")
+
+
+class ProcessCancelled(Exception):
+    """Raised when a user requests cancellation at a safe checkpoint."""
+
+
+def check_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ProcessCancelled("Operation cancelled by the user.")
 
 
 @dataclass
@@ -390,11 +400,16 @@ def get_outlook_namespace():
     return outlook.GetNamespace("MAPI")
 
 
-def list_outlook_folder_paths(namespace) -> list[tuple[str, str]]:
+def list_outlook_folder_paths(
+    namespace,
+    cancel_event: threading.Event | None = None,
+) -> list[tuple[str, str]]:
     """Returns folder names paired with their mailbox-rooted paths."""
+    check_cancelled(cancel_event)
     folders = [("Inbox", "Inbox")]
 
     def collect_folders(folder, parent_path=""):
+        check_cancelled(cancel_event)
         folder_name = str(folder.Name).strip()
         current_path = (
             f"{parent_path}\\{folder_name}"
@@ -404,15 +419,19 @@ def list_outlook_folder_paths(namespace) -> list[tuple[str, str]]:
         folders.append((folder_name, current_path))
 
         for child_folder in folder.Folders:
+            check_cancelled(cancel_event)
             collect_folders(child_folder, current_path)
 
     for root_folder in namespace.Folders:
+        check_cancelled(cancel_event)
         collect_folders(root_folder)
 
-    return sorted(
+    sorted_folders = sorted(
         folders,
         key=lambda item: (item[0].casefold(), item[1].casefold()),
     )
+    check_cancelled(cancel_event)
+    return sorted_folders
 
 
 def filter_outlook_folder_choices(
@@ -435,11 +454,13 @@ def filter_outlook_folder_choices(
 def get_outlook_folder(
     namespace,
     folder_path: str = "Inbox",
+    cancel_event: threading.Event | None = None,
 ):
     """
     Resolves Inbox paths, mailbox-rooted paths, and unique bare folder names.
     """
     requested_path = folder_path.strip() or "Inbox"
+    check_cancelled(cancel_event)
     path_parts = [
         part.strip()
         for part in re.split(r"[\\/]+", requested_path)
@@ -460,6 +481,7 @@ def get_outlook_folder(
         all_folders = []
 
         def collect_folders(folder, parent_path=""):
+            check_cancelled(cancel_event)
             folder_name = str(folder.Name).strip()
             current_path = (
                 f"{parent_path}\\{folder_name}"
@@ -471,9 +493,11 @@ def get_outlook_folder(
             )
 
             for child_folder in folder.Folders:
+                check_cancelled(cancel_event)
                 collect_folders(child_folder, current_path)
 
         for root_folder in namespace.Folders:
+            check_cancelled(cancel_event)
             collect_folders(root_folder)
 
         requested_name = path_parts[0].casefold()
@@ -520,6 +544,7 @@ def get_outlook_folder(
         mailbox_folders = list(namespace.Folders)
 
         for folder in mailbox_folders:
+            check_cancelled(cancel_event)
             if str(folder.Name).strip().casefold() == path_parts[0].casefold():
                 current_folder = folder
                 break
@@ -538,9 +563,11 @@ def get_outlook_folder(
         path_parts = path_parts[1:]
 
     for requested_name in path_parts:
+        check_cancelled(cancel_event)
         next_folder = None
 
         for folder in current_folder.Folders:
+            check_cancelled(cancel_event)
             if (
                 str(folder.Name).strip().casefold()
                 == requested_name.casefold()
@@ -574,6 +601,7 @@ def get_outlook_folder(
 def list_excel_attachments(
     file_name_filter: str = "",
     folder_path: str = "Inbox",
+    cancel_event: threading.Event | None = None,
 ) -> list[AttachmentInfo]:
     """
     Searches recent Outlook messages in the selected folder for matching
@@ -584,11 +612,13 @@ def list_excel_attachments(
 
     Results are returned newest first.
     """
+    check_cancelled(cancel_event)
     namespace = get_outlook_namespace()
 
     outlook_folder = get_outlook_folder(
         namespace,
         folder_path,
+        cancel_event,
     )
 
     messages = outlook_folder.Items
@@ -598,6 +628,7 @@ def list_excel_attachments(
         "[ReceivedTime]",
         True,
     )
+    check_cancelled(cancel_event)
 
     requested_text = (
         file_name_filter
@@ -611,6 +642,7 @@ def list_excel_attachments(
         messages,
         start=1,
     ):
+        check_cancelled(cancel_event)
         if message_number > OUTLOOK_MESSAGE_LIMIT:
             break
 
@@ -662,6 +694,7 @@ def list_excel_attachments(
             1,
             attachment_count + 1,
         ):
+            check_cancelled(cancel_event)
             try:
                 attachment = (
                     message
@@ -715,12 +748,14 @@ def list_excel_attachments(
 
 def save_attachment(
     attachment_info: AttachmentInfo,
+    cancel_event: threading.Event | None = None,
 ) -> Path:
     """
     Downloads the selected Outlook attachment to a temporary folder.
 
     An existing file is not overwritten. A number is added instead.
     """
+    check_cancelled(cancel_event)
     namespace = get_outlook_namespace()
 
     message = namespace.GetItemFromID(
@@ -768,6 +803,11 @@ def save_attachment(
     attachment.SaveAsFile(
         str(output_path)
     )
+    try:
+        check_cancelled(cancel_event)
+    except ProcessCancelled:
+        output_path.unlink(missing_ok=True)
+        raise
 
     if not output_path.exists():
         raise RuntimeError(
@@ -1073,6 +1113,7 @@ def work_type_matches(
 def read_filtered_source_rows(
     source_sheet,
     selected_queue: str,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[str], list[list]]:
     """
     Reads ordinary worksheet cells.
@@ -1085,11 +1126,13 @@ def read_filtered_source_rows(
     5. Returns (headers, rows).
     """
 
+    check_cancelled(cancel_event)
     used_range = source_sheet.UsedRange
 
     source_rows = range_to_rows(
         used_range.Value
     )
+    check_cancelled(cancel_event)
 
     if not source_rows:
         raise RuntimeError(
@@ -1166,6 +1209,7 @@ def read_filtered_source_rows(
     for source_row in source_rows[
         data_start_index:
     ]:
+        check_cancelled(cancel_event)
 
         work_type_value = (
             source_row[work_type_index]
@@ -1325,6 +1369,7 @@ def append_dor_import_record(
     dor_sheet,
     production_date: date,
     summary_values: tuple,
+    highlight_imported_data: bool = False,
 ) -> int:
     """Writes the imported report's summary values to the DOR sheet."""
     dor_row = 5
@@ -1355,6 +1400,11 @@ def append_dor_import_record(
             dor_row,
             1,
         ).NumberFormat = "mm/dd/yyyy"
+        if highlight_imported_data:
+            dor_sheet.Range(
+                dor_sheet.Cells(dor_row, 1),
+                dor_sheet.Cells(dor_row, 4),
+            ).Interior.Color = IMPORTED_DATA_HIGHLIGHT_COLOR
     except Exception:
         if row_inserted:
             dor_sheet.Rows("6:6").Delete(
@@ -1597,11 +1647,37 @@ def fill_metadata(
     )
 
 
+def fill_inserted_row_formulas(
+    destination_sheet,
+    first_row: int,
+    row_count: int,
+) -> None:
+    """Populates calculated columns for rows inserted at a chosen row."""
+    if row_count <= 0:
+        return
+
+    final_row = first_row + row_count - 1
+
+    formulas_by_column = {
+        15: "=RC[-6]-RC[-8]",
+        16: "=IF(RC[-7]-RC[-9]>0.5,1,0)",
+        18: "=XLOOKUP(RC[-5],'VC Value per Report'!C1,'VC Value per Report'!C2)",
+    }
+
+    for column_number, formula in formulas_by_column.items():
+        formula_range = destination_sheet.Range(
+            destination_sheet.Cells(first_row, column_number),
+            destination_sheet.Cells(final_row, column_number),
+        )
+        formula_range.FormulaR1C1 = formula
+
+
 # ============================================================
 # MAIN IMPORT FUNCTION
 # ============================================================
 def find_source_data_sheet(
     source_workbook,
+    cancel_event: threading.Event | None = None,
 ):
     """
     Searches every worksheet for a likely header row.
@@ -1613,6 +1689,7 @@ def find_source_data_sheet(
     checked_sheets = []
 
     for source_sheet in source_workbook.Worksheets:
+        check_cancelled(cancel_event)
         sheet_name = str(
             source_sheet.Name
         )
@@ -1625,6 +1702,7 @@ def find_source_data_sheet(
             source_rows = range_to_rows(
                 source_sheet.UsedRange.Value
             )
+            check_cancelled(cancel_event)
 
             if not source_rows:
                 continue
@@ -1653,11 +1731,14 @@ def import_attachment(
     production_date: date,
     week_override: str,
     row_override: int | None = None,
+    cancel_event: threading.Event | None = None,
+    highlight_imported_data: bool = False,
 ) -> dict:
     """
     Opens the attachment as read-only and imports the filtered rows
     into the already-open destination workbook.
     """
+    check_cancelled(cancel_event)
     excel = win32com.client.Dispatch(
         "Excel.Application"
     )
@@ -1695,6 +1776,7 @@ def import_attachment(
     source_workbook = None
 
     try:
+        check_cancelled(cancel_event)
         source_workbook = excel.Workbooks.Open(
             str(source_path),
             UpdateLinks=0,
@@ -1703,12 +1785,14 @@ def import_attachment(
         )
 
         source_sheet = find_source_data_sheet(
-            source_workbook
+            source_workbook,
+            cancel_event,
         )
         
         result = read_filtered_source_rows(
             source_sheet,
             selected_queue,
+            cancel_event,
         )
 
         logger.info(
@@ -1794,9 +1878,21 @@ def import_attachment(
                 "fallback calculation"
             )
 
+        imported_columns = [
+            user_column,
+            user_column + len(source_headers) - 1,
+            destination_headers[normalize("Week")],
+            destination_headers[normalize("Day")],
+            destination_headers[normalize("Production Date")],
+            15,
+            16,
+            18,
+        ]
+
         rows_inserted = False
 
         try:
+            check_cancelled(cancel_event)
             if row_override is not None:
                 insert_destination_rows(
                     destination_sheet,
@@ -1804,6 +1900,7 @@ def import_attachment(
                     len(source_rows),
                 )
                 rows_inserted = True
+                check_cancelled(cancel_event)
 
             # Source data starts under the destination USER column.
             write_matrix(
@@ -1822,6 +1919,26 @@ def import_attachment(
                 week_value,
                 production_date,
             )
+
+            if row_override is not None:
+                fill_inserted_row_formulas(
+                    destination_sheet,
+                    first_destination_row,
+                    len(source_rows),
+                )
+                check_cancelled(cancel_event)
+
+            if highlight_imported_data:
+                destination_sheet.Range(
+                    destination_sheet.Cells(
+                        first_destination_row,
+                        min(imported_columns),
+                    ),
+                    destination_sheet.Cells(
+                        first_destination_row + len(source_rows) - 1,
+                        max(imported_columns),
+                    ),
+                ).Interior.Color = IMPORTED_DATA_HIGHLIGHT_COLOR
         except Exception:
             if rows_inserted:
                 inserted_final_row = (
@@ -1840,6 +1957,7 @@ def import_attachment(
             dor_sheet,
             production_date,
             summary_values,
+            highlight_imported_data,
         )
 
         destination_workbook.Save()
@@ -1853,6 +1971,8 @@ def import_attachment(
                 + len(source_rows)
                 - 1
             ),
+            "first_column": min(imported_columns),
+            "last_column": max(imported_columns),
             "week": week_value,
             "week_source": week_source,
             "dor_row": dor_row,

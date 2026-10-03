@@ -17,8 +17,11 @@ from tkinter import messagebox, ttk
 from outlook_dor_importer import (
     AttachmentInfo,
     DESTINATION_WORKBOOK_NAMES,
+    ProcessCancelled,
     SessionTimer,
+    check_cancelled,
     extract_date_from_filename,
+    filter_outlook_folder_choices,
     get_outlook_namespace,
     import_attachment,
     list_excel_attachments,
@@ -98,6 +101,9 @@ class OutlookDORImporterApp(tk.Tk):
         self.row_override_var = (
             tk.StringVar()
         )
+        self.highlight_imported_var = tk.BooleanVar(
+            value=False
+        )
 
         self.status_var = tk.StringVar(
             value=(
@@ -117,6 +123,7 @@ class OutlookDORImporterApp(tk.Tk):
         self.ui_events = queue.Queue()
         self.closing = False
         self.action_active = False
+        self.cancel_event = threading.Event()
 
         self.protocol(
             "WM_DELETE_WINDOW",
@@ -213,19 +220,14 @@ class OutlookDORImporterApp(tk.Tk):
         message: str,
     ):
         """
-        Shows a Windows toast and taskbar attention when the app is inactive.
+        Shows a Windows toast and taskbar attention when the app is minimized.
         """
         try:
+            if self.state() != "iconic":
+                return
+
             window_handle = self.winfo_id()
             user32 = ctypes.windll.user32
-            is_inactive = (
-                self.state() == "iconic"
-                or user32.GetForegroundWindow()
-                != window_handle
-            )
-
-            if not is_inactive:
-                return
 
             self.bell()
 
@@ -559,26 +561,26 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             pady=5,
         )
 
-        refresh_button = ttk.Button(
+        self.refresh_attachments_button = ttk.Button(
             settings_frame,
             text="Refresh Attachments",
             command=self.refresh_attachments,
         )
 
-        refresh_button.grid(
+        self.refresh_attachments_button.grid(
             row=1,
             column=3,
             padx=(10, 0),
             pady=5,
         )
 
-        latest_button = ttk.Button(
+        self.latest_button = ttk.Button(
             settings_frame,
             text="Select Latest",
             command=self.select_latest,
         )
 
-        latest_button.grid(
+        self.latest_button.grid(
             row=1,
             column=4,
             padx=(8, 0),
@@ -767,10 +769,30 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             self.attachment_selection_changed,
         )
 
+        action_frame = ttk.Frame(main_frame)
+        action_frame.pack(
+            anchor="e",
+            pady=(0, 10),
+        )
+
         self.import_button = ttk.Button(
-            main_frame,
+            action_frame,
             text="Import Selected Attachment",
             command=self.run_import,
+        )
+
+        self.highlight_imported_checkbutton = ttk.Checkbutton(
+            action_frame,
+            text="Highlight imported data",
+            variable=self.highlight_imported_var,
+        )
+
+        self.highlight_imported_checkbutton.pack(
+            side="left",
+            padx=(0, 12),
+        )
+        self.import_button.pack(
+            side="left",
         )
         
         progress_frame = ttk.Frame(
@@ -809,9 +831,15 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             padx=(10, 0),
         )
 
-        self.import_button.pack(
-            anchor="e",
-            pady=(0, 10),
+        self.cancel_button = ttk.Button(
+            progress_frame,
+            text="Cancel",
+            command=self.cancel_active_process,
+            state="disabled",
+        )
+        self.cancel_button.pack(
+            side="right",
+            padx=(10, 0),
         )
 
         status_frame = ttk.LabelFrame(
@@ -843,6 +871,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         self.action_active = busy
 
         if busy:
+            self.cancel_event.clear()
             self.progress.configure(
                 mode="determinate"
             )
@@ -857,6 +886,21 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             self.import_button.configure(
                 state="disabled"
             )
+            self.refresh_folders_button.configure(
+                state="disabled"
+            )
+            self.refresh_attachments_button.configure(
+                state="disabled"
+            )
+            self.latest_button.configure(
+                state="disabled"
+            )
+            self.highlight_imported_checkbutton.configure(
+                state="disabled"
+            )
+            self.cancel_button.configure(
+                state="normal"
+            )
 
         else:
             self.configure(
@@ -866,8 +910,39 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             self.import_button.configure(
                 state="normal"
             )
+            self.refresh_folders_button.configure(
+                state="normal"
+            )
+            self.refresh_attachments_button.configure(
+                state="normal"
+            )
+            self.latest_button.configure(
+                state="normal"
+            )
+            self.highlight_imported_checkbutton.configure(
+                state="normal"
+            )
+            self.cancel_button.configure(
+                state="disabled"
+            )
 
         self.update_idletasks()
+
+    def cancel_active_process(self):
+        if not self.action_active or self.cancel_event.is_set():
+            return
+
+        self.cancel_event.set()
+        self.progress_target = 0.0
+        self.progress["value"] = 0
+        self.progress_percent_var.set("0%")
+        self.cancel_button.configure(
+            state="disabled"
+        )
+        self.set_activity("Cancellation requested; stopping at the next safe point...")
+        self.status_var.set(
+            "Cancellation requested. Waiting for the current Outlook or Excel call to return."
+        )
 
     def update_progress(
         self,
@@ -1084,14 +1159,12 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 
 
     def refresh_outlook_folders(self):
-        if self.folder_loading:
+        if self.folder_loading or self.action_active:
             return
 
         self.folder_loading = True
+        self.set_busy(True)
         self.set_activity("Loading Outlook folders...")
-        self.refresh_folders_button.configure(
-            state="disabled"
-        )
 
         threading.Thread(
             target=self._outlook_folders_worker,
@@ -1107,7 +1180,11 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             pythoncom.CoInitialize()
             com_initialized = True
             namespace = get_outlook_namespace()
-            folders = list_outlook_folder_paths(namespace)
+            folders = list_outlook_folder_paths(
+                namespace,
+                self.cancel_event,
+            )
+            check_cancelled(self.cancel_event)
         except Exception as caught_error:
             error = caught_error
         finally:
@@ -1126,9 +1203,12 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         error: Exception | None,
     ):
         self.folder_loading = False
-        self.refresh_folders_button.configure(
-            state="normal"
-        )
+        self.set_busy(False)
+
+        if isinstance(error, ProcessCancelled):
+            self.set_activity("Outlook folder refresh cancelled")
+            self.status_var.set("Outlook folder refresh cancelled.")
+            return
 
         if error is not None:
             self.set_activity("Could not load Outlook folders")
@@ -1187,6 +1267,9 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 
 
     def refresh_attachments(self):
+        if self.action_active:
+            return
+
         folder_path = self.selected_outlook_folder_path()
         self.set_activity("Searching Outlook...")
         self.set_busy(True)
@@ -1200,6 +1283,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             args=(
                 self.file_filter_var.get(),
                 folder_path,
+                self.cancel_event,
             ),
             daemon=True,
         ).start()
@@ -1208,6 +1292,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         self,
         file_name_filter: str,
         folder_path: str,
+        cancel_event: threading.Event,
     ):
         attachments = None
         error = None
@@ -1221,7 +1306,9 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             attachments = list_excel_attachments(
                 file_name_filter,
                 folder_path,
+                cancel_event,
             )
+            check_cancelled(cancel_event)
 
         except Exception as caught_error:
             error = caught_error
@@ -1230,11 +1317,12 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             if com_initialized:
                 pythoncom.CoUninitialize()
 
+        was_cancelled = isinstance(error, ProcessCancelled)
         duration_seconds = self.session_timer.finish(
             "Refresh Attachments",
             process_started_at,
-            error is None,
-            error,
+            error is None or was_cancelled,
+            None if was_cancelled else error,
         )
 
         self.post_ui_event(
@@ -1250,6 +1338,14 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         error,
         duration_seconds: float,
     ):
+        if isinstance(error, ProcessCancelled):
+            self.set_activity("Attachment refresh cancelled")
+            self.status_var.set(
+                "Attachment refresh cancelled. Existing results were kept."
+            )
+            self.set_busy(False)
+            return
+
         if error is not None:
             self.set_activity("Attachment refresh failed")
             self.notify_action_complete(
@@ -1417,6 +1513,9 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 
 
     def run_import(self):
+        if self.action_active:
+            return
+
         selected_attachment = (
             self.get_selected_attachment()
         )
@@ -1497,6 +1596,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                 self.queue_var.get(),
                 self.week_override_var.get(),
                 row_override,
+                self.highlight_imported_var.get(),
             ),
             daemon=True,
         ).start()
@@ -1509,6 +1609,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         selected_queue: str,
         week_override: str,
         row_override: int | None,
+        highlight_imported_data: bool,
     ):
         result = None
         error = None
@@ -1524,15 +1625,20 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 
             try:
                 downloaded_path = save_attachment(
-                    selected_attachment
+                    selected_attachment,
+                    self.cancel_event,
                 )
             except Exception as caught_error:
+                was_cancelled = isinstance(
+                    caught_error,
+                    ProcessCancelled,
+                )
                 stage_durations["Download attachment"] = (
                     self.session_timer.finish(
                         "Download attachment",
                         download_started_at,
-                        False,
-                        caught_error,
+                        was_cancelled,
+                        None if was_cancelled else caught_error,
                     )
                 )
                 raise
@@ -1545,6 +1651,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                     )
                 )
 
+            check_cancelled(self.cancel_event)
             self.post_ui_event(
                 self.update_progress,
                 45,
@@ -1561,14 +1668,20 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                     production_date=production_date,
                     week_override=week_override,
                     row_override=row_override,
+                    cancel_event=self.cancel_event,
+                    highlight_imported_data=highlight_imported_data,
                 )
             except Exception as caught_error:
+                was_cancelled = isinstance(
+                    caught_error,
+                    ProcessCancelled,
+                )
                 stage_durations["Copy into Excel"] = (
                     self.session_timer.finish(
                         "Copy into Excel",
                         import_started_at,
-                        False,
-                        caught_error,
+                        was_cancelled,
+                        None if was_cancelled else caught_error,
                     )
                 )
                 raise
@@ -1591,8 +1704,8 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         duration_seconds = self.session_timer.finish(
             "Import Selected Attachment",
             process_started_at,
-            error is None,
-            error,
+            error is None or isinstance(error, ProcessCancelled),
+            None if isinstance(error, ProcessCancelled) else error,
         )
 
         self.post_ui_event(
@@ -1610,6 +1723,14 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         duration_seconds: float,
         stage_durations: dict[str, float],
     ):
+        if isinstance(error, ProcessCancelled):
+            self.set_activity("Import cancelled")
+            self.status_var.set(
+                "Import cancelled before the destination data was changed."
+            )
+            self.set_busy(False)
+            return
+
         if error is not None:
             self.set_activity("Import failed")
             self.notify_action_complete(
@@ -1658,6 +1779,12 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             f"{stage_durations['Copy into Excel']:.2f} seconds\n"
             f"Total import time: {duration_seconds:.2f} seconds"
         )
+
+        if self.cancel_event.is_set():
+            summary += (
+                "\n\nCancellation was requested while Excel was "
+                "writing data, so this import finished before stopping."
+            )
 
         self.status_var.set(summary)
         self.set_activity("Import completed", done=True)
