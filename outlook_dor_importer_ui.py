@@ -1992,9 +1992,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             undo_imported_data(
                 import_record["result"],
                 import_record["raw_row_segments"],
-                import_record["row_override"] is not None,
                 import_record["dor_row"],
-                import_record["dor_row_inserted"],
                 ranges_to_remove,
                 remaining_ranges,
                 rehighlight_remaining,

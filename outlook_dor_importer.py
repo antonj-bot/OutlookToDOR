@@ -1659,9 +1659,7 @@ def refresh_destination_workbook_data(
 def undo_imported_data(
     import_result: dict,
     raw_row_segments: list[tuple[int, int]],
-    raw_rows_inserted: bool,
     dor_row: int,
-    dor_row_inserted: bool,
     ranges_to_remove: list[dict],
     remaining_ranges: list[dict],
     rehighlight_remaining: bool,
@@ -1701,58 +1699,18 @@ def undo_imported_data(
             pivot_sheet.Cells(last_row, last_column),
         ).Interior.Pattern = XL_NONE
 
-    raw_ranges = [
-        imported_range
-        for imported_range in ranges_to_remove
-        if imported_range.get("kind") == "raw"
-    ]
-    if raw_rows_inserted:
-        for first_row, last_row in sorted(raw_row_segments, reverse=True):
-            raw_sheet.Rows(
-                f"{first_row}:{last_row}"
-            ).Delete(
-                Shift=XL_UP,
-            )
-    else:
-        for raw_range in raw_ranges:
-            raw_data_range = raw_sheet.Range(
-                raw_sheet.Cells(
-                    raw_range["first_row"],
-                    raw_range["first_column"],
-                ),
-                raw_sheet.Cells(
-                    raw_range["last_row"],
-                    raw_range["last_column"],
-                ),
-            )
-            raw_data_range.ClearContents()
-            raw_data_range.Interior.Pattern = XL_NONE
-
-    dor_ranges = [
-        imported_range
-        for imported_range in ranges_to_remove
-        if imported_range.get("kind") == "dor"
-    ]
-    if dor_row_inserted:
-        dor_sheet.Rows(
-            f"{dor_row}:{dor_row}"
+    for first_row, last_row in sorted(raw_row_segments, reverse=True):
+        raw_sheet.Rows(
+            f"{first_row}:{last_row}"
         ).Delete(
             Shift=XL_UP,
         )
-    else:
-        for dor_range in dor_ranges:
-            dor_data_range = dor_sheet.Range(
-                dor_sheet.Cells(
-                    dor_range["first_row"],
-                    dor_range["first_column"],
-                ),
-                dor_sheet.Cells(
-                    dor_range["last_row"],
-                    dor_range["last_column"],
-                ),
-            )
-            dor_data_range.ClearContents()
-            dor_data_range.Interior.Pattern = XL_NONE
+
+    dor_sheet.Rows(
+        f"{dor_row}:{dor_row}"
+    ).Delete(
+        Shift=XL_UP,
+    )
 
     try:
         workbook.RefreshAll()
