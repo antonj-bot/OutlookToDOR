@@ -101,6 +101,12 @@ DOR_COLUMN_SOURCE_COLORS = {
     15: DOR_SOURCE_COLORS["auto extraction average report/hr"],
 }
 
+DOR_COMPARISON_SECTION_TITLE = "ECRASH - MANUAL VS AUTO (ALL STATES)"
+DOR_COMPARISON_EXCLUDING_TX_SECTION_TITLE = (
+    "ECRASH - MANUAL VS AUTO (EXCLUDING TX)"
+)
+DOR_HEADER_ROWS = (2, 3, 4)
+
 # ============================================================
 # PROCESS TIMING
 # ============================================================
@@ -1472,6 +1478,279 @@ def append_dor_import_record(
     return dor_row
 
 
+def get_header_path_map(
+    worksheet,
+    first_header_row: int,
+    last_header_row: int,
+    first_column: int,
+    last_column: int,
+) -> dict[str, list[int]]:
+    """Maps normalized multi-row headers to their worksheet columns."""
+    header_rows = range_to_rows(
+        worksheet.Range(
+            worksheet.Cells(first_header_row, first_column),
+            worksheet.Cells(last_header_row, last_column),
+        ).Value
+    )
+    expanded_parent_rows = []
+
+    for header_row in header_rows[:-1]:
+        expanded_row = []
+        current_header = ""
+        for value in header_row:
+            if has_value(value):
+                current_header = normalize(value)
+            expanded_row.append(current_header)
+        expanded_parent_rows.append(expanded_row)
+
+    header_columns: dict[str, list[int]] = {}
+    for column_offset in range(last_column - first_column + 1):
+        leaf = ""
+        leaf_row_index = -1
+        for row_index in range(len(header_rows) - 1, -1, -1):
+            if column_offset < len(header_rows[row_index]):
+                leaf = normalize(header_rows[row_index][column_offset])
+            if leaf:
+                leaf_row_index = row_index
+                break
+
+        if not leaf:
+            continue
+
+        if leaf_row_index == len(header_rows) - 1:
+            parent_headers = [
+                parent_row[column_offset]
+                for parent_row in expanded_parent_rows
+                if column_offset < len(parent_row)
+                and parent_row[column_offset]
+            ]
+            header = normalize(" ".join((*parent_headers, leaf)))
+        else:
+            header = leaf
+
+        header_columns.setdefault(header, []).append(
+            first_column + column_offset
+        )
+
+    return header_columns
+
+
+def get_dor_comparison_mapping(
+    comparison_sheet,
+    dor_sheet,
+    section_title: str = DOR_COMPARISON_SECTION_TITLE,
+) -> dict:
+    """Locates the comparison section and matches its headers to DOR."""
+    used_range = comparison_sheet.UsedRange
+    rows = range_to_rows(used_range.Value)
+    first_row = int(used_range.Row)
+    first_column = int(used_range.Column)
+    title_row = None
+    title_column = None
+
+    for row_offset, row_values in enumerate(rows):
+        for column_offset, value in enumerate(row_values):
+            if normalize(value) == normalize(section_title):
+                title_row = first_row + row_offset
+                title_column = first_column + column_offset
+                break
+        if title_row is not None:
+            break
+
+    if title_row is None or title_column is None:
+        raise RuntimeError(
+            f'The section "{section_title}" was not found '
+            f'on "{comparison_sheet.Name}".'
+        )
+
+    last_used_column = (
+        first_column + int(used_range.Columns.Count) - 1
+    )
+    section_last_column = last_used_column
+    title_values = range_to_rows(
+        comparison_sheet.Range(
+            comparison_sheet.Cells(title_row, title_column),
+            comparison_sheet.Cells(title_row, last_used_column),
+        ).Value
+    )[0]
+    for column_offset, value in enumerate(title_values[1:], start=1):
+        if has_value(value):
+            section_last_column = title_column + column_offset - 1
+            break
+
+    comparison_header_first_row = title_row + 1
+    comparison_header_last_row = title_row + len(DOR_HEADER_ROWS)
+    comparison_headers = get_header_path_map(
+        comparison_sheet,
+        comparison_header_first_row,
+        comparison_header_last_row,
+        title_column,
+        section_last_column,
+    )
+
+    dor_used_range = dor_sheet.UsedRange
+    dor_first_column = int(dor_used_range.Column)
+    dor_last_column = (
+        dor_first_column + int(dor_used_range.Columns.Count) - 1
+    )
+    dor_headers = get_header_path_map(
+        dor_sheet,
+        DOR_HEADER_ROWS[0],
+        DOR_HEADER_ROWS[-1],
+        dor_first_column,
+        dor_last_column,
+    )
+
+    matching_columns = []
+    for header, comparison_columns in comparison_headers.items():
+        dor_columns = dor_headers.get(header, [])
+        if not dor_columns:
+            continue
+        if len(dor_columns) > 1:
+            raise RuntimeError(
+                f'The DOR header "{header}" is ambiguous.'
+            )
+        matching_columns.extend(
+            (comparison_column, dor_columns[0])
+            for comparison_column in comparison_columns
+        )
+
+    production_date_column = next(
+        (
+            comparison_column
+            for header, comparison_columns in comparison_headers.items()
+            if header == normalize("Production Date")
+            for comparison_column in comparison_columns
+        ),
+        None,
+    )
+    if production_date_column is None:
+        raise RuntimeError(
+            f'The section "{section_title}" does not have '
+            'a "Production Date" header.'
+        )
+    if not matching_columns:
+        raise RuntimeError(
+            f'No matching headers were found between "DOR" and the '
+            f'"{section_title}" section.'
+        )
+
+    return {
+        "column_pairs": matching_columns,
+        "production_date_column": production_date_column,
+        "header_last_row": comparison_header_last_row,
+        "first_column": min(column for column, _ in matching_columns),
+        "last_column": max(column for column, _ in matching_columns),
+    }
+
+
+def append_dor_comparison_record(
+    comparison_sheet,
+    dor_sheet,
+    dor_row: int,
+    comparison_mapping: dict,
+    highlight_imported_data: bool = False,
+    source_column_values: dict[int, object] | None = None,
+    target_row: int | None = None,
+) -> dict:
+    """Copies matching DOR headers into a new comparison section row."""
+    date_column = comparison_mapping["production_date_column"]
+    used_range = comparison_sheet.UsedRange
+    used_last_row = int(used_range.Row) + int(used_range.Rows.Count) - 1
+    if target_row is not None:
+        row_number = target_row
+        row_inserted = False
+    else:
+        grand_total_row = None
+        for row_number in range(
+            comparison_mapping["header_last_row"] + 1,
+            used_last_row + 1,
+        ):
+            if normalize(
+                comparison_sheet.Cells(row_number, date_column).Value
+            ) == "grand total":
+                grand_total_row = row_number
+                break
+
+        row_inserted = grand_total_row is not None
+        if row_inserted:
+            row_number = grand_total_row
+            insert_destination_rows(comparison_sheet, row_number, 1)
+        else:
+            last_data_row = int(
+                comparison_sheet
+                .Cells(comparison_sheet.Rows.Count, date_column)
+                .End(XL_UP)
+                .Row
+            )
+            row_number = max(
+                comparison_mapping["header_last_row"] + 1,
+                last_data_row + 1,
+            )
+
+    source_colors = {
+        comparison_column: DOR_COLUMN_SOURCE_COLORS[dor_column]
+        for comparison_column, dor_column in comparison_mapping["column_pairs"]
+        if dor_column in DOR_COLUMN_SOURCE_COLORS
+    }
+
+    try:
+        for comparison_column, dor_column in comparison_mapping["column_pairs"]:
+            source_value = (
+                source_column_values[dor_column]
+                if source_column_values is not None
+                and dor_column in source_column_values
+                else dor_sheet.Cells(dor_row, dor_column).Value
+            )
+            comparison_sheet.Cells(
+                row_number,
+                comparison_column,
+            ).Value = source_value
+
+        if highlight_imported_data:
+            comparison_sheet.Range(
+                comparison_sheet.Cells(
+                    row_number,
+                    comparison_mapping["first_column"],
+                ),
+                comparison_sheet.Cells(
+                    row_number,
+                    comparison_mapping["last_column"],
+                ),
+            ).Interior.Color = IMPORTED_DATA_HIGHLIGHT_COLOR
+        for comparison_column, source_color in source_colors.items():
+            comparison_sheet.Cells(
+                row_number,
+                comparison_column,
+            ).Interior.Color = source_color
+    except Exception:
+        if row_inserted:
+            comparison_sheet.Rows(
+                f"{row_number}:{row_number}"
+            ).Delete(Shift=XL_UP)
+        else:
+            comparison_sheet.Range(
+                comparison_sheet.Cells(
+                    row_number,
+                    comparison_mapping["first_column"],
+                ),
+                comparison_sheet.Cells(
+                    row_number,
+                    comparison_mapping["last_column"],
+                ),
+            ).ClearContents()
+        raise
+
+    return {
+        "first_row": row_number,
+        "last_row": row_number,
+        "first_column": comparison_mapping["first_column"],
+        "last_column": comparison_mapping["last_column"],
+        "row_inserted": row_inserted,
+        "source_colors": source_colors,
+    }
+
+
 def resolve_imported_highlight_range(
     worksheet,
     imported_range: dict,
@@ -1563,6 +1842,22 @@ def clear_imported_data_highlight(
                     last_column,
                 ),
             ).Interior.Pattern = XL_NONE
+            range_kind = imported_range.get("kind")
+            if range_kind == "dor":
+                for column_number, source_color in DOR_COLUMN_SOURCE_COLORS.items():
+                    worksheet.Cells(
+                        first_row,
+                        column_number,
+                    ).Interior.Color = source_color
+            elif range_kind == "dor_comparison":
+                for column_number, source_color in imported_range.get(
+                    "source_colors",
+                    {},
+                ).items():
+                    worksheet.Cells(
+                        first_row,
+                        column_number,
+                    ).Interior.Color = source_color
             changed_workbooks[workbook_key] = workbook
 
         check_cancelled(cancel_event)
@@ -1626,6 +1921,15 @@ def highlight_imported_data_ranges(
                         first_row,
                         column_number,
                     ).Interior.Color = source_color
+            elif range_kind == "dor_comparison":
+                for column_number, source_color in imported_range.get(
+                    "source_colors",
+                    {},
+                ).items():
+                    worksheet.Cells(
+                        first_row,
+                        column_number,
+                    ).Interior.Color = source_color
             elif range_kind == "pivot":
                 worksheet.Cells(
                     first_row,
@@ -1665,7 +1969,7 @@ def undo_imported_data(
     rehighlight_remaining: bool,
     cancel_event: threading.Event | None = None,
 ) -> None:
-    """Removes one completed import from raw data and DOR, then refreshes pivots."""
+    """Removes one completed import from raw data and summary sheets."""
     check_cancelled(cancel_event)
     excel = win32com.client.Dispatch("Excel.Application")
     excel.Visible = True
@@ -1712,6 +2016,44 @@ def undo_imported_data(
         Shift=XL_UP,
     )
 
+    comparison_ranges = [
+        imported_range
+        for imported_range in ranges_to_remove
+        if imported_range.get("kind") == "dor_comparison"
+    ]
+    comparison_rows = {}
+    for comparison_range in comparison_ranges:
+        row_key = (
+            comparison_range["sheet"].casefold(),
+            comparison_range["first_row"],
+            comparison_range["last_row"],
+        )
+        comparison_rows.setdefault(row_key, []).append(comparison_range)
+
+    for (sheet_name, first_row, last_row), row_ranges in comparison_rows.items():
+        comparison_sheet = find_sheet(workbook, sheet_name)
+        if any(item.get("row_inserted") for item in row_ranges):
+            comparison_sheet.Rows(
+                f"{first_row}:{last_row}"
+            ).Delete(
+                Shift=XL_UP,
+            )
+            continue
+
+        for comparison_range in row_ranges:
+            comparison_data_range = comparison_sheet.Range(
+                comparison_sheet.Cells(
+                    comparison_range["first_row"],
+                    comparison_range["first_column"],
+                ),
+                comparison_sheet.Cells(
+                    comparison_range["last_row"],
+                    comparison_range["last_column"],
+                ),
+            )
+            comparison_data_range.ClearContents()
+            comparison_data_range.Interior.Pattern = XL_NONE
+
     try:
         workbook.RefreshAll()
         excel.CalculateUntilAsyncQueriesDone()
@@ -1748,7 +2090,9 @@ def get_dor_summary_values(
         "total completed & average per hour",
         "past 12-hr tat",
         "manual reports",
+        "manual ave/hr",
         "auto extraction",
+        "auto extraction ave/hr",
     }
     sections = {}
 
@@ -1879,8 +2223,24 @@ def get_dor_summary_values(
     main_section = sections.get("total completed & average per hour")
     tat_section = sections.get("past 12-hr tat")
     auto_manual_section = sections.get("auto vs manual")
-    manual_reports_section = sections.get("manual reports")
-    auto_extraction_section = sections.get("auto extraction")
+    manual_reports_name = next(
+        (
+            name
+            for name in ("manual reports", "manual ave/hr")
+            if name in sections and date_headers.get(name) is not None
+        ),
+        "manual reports",
+    )
+    auto_extraction_name = next(
+        (
+            name
+            for name in ("auto extraction", "auto extraction ave/hr")
+            if name in sections and date_headers.get(name) is not None
+        ),
+        "auto extraction",
+    )
+    manual_reports_section = sections.get(manual_reports_name)
+    auto_extraction_section = sections.get(auto_extraction_name)
     if any(
         section is None
         for section in (
@@ -1898,8 +2258,8 @@ def get_dor_summary_values(
     main_date_header = date_headers["total completed & average per hour"]
     tat_date_header = date_headers["past 12-hr tat"]
     auto_manual_date_header = date_headers["auto vs manual"]
-    manual_reports_date_header = date_headers["manual reports"]
-    auto_extraction_date_header = date_headers["auto extraction"]
+    manual_reports_date_header = date_headers[manual_reports_name]
+    auto_extraction_date_header = date_headers[auto_extraction_name]
     if any(
         date_header is None
         for date_header in (
@@ -1927,11 +2287,11 @@ def get_dor_summary_values(
         auto_manual_date_header,
     )
     manual_reports_data_row = find_data_row(
-        "manual reports",
+        manual_reports_name,
         manual_reports_date_header,
     )
     auto_extraction_data_row = find_data_row(
-        "auto extraction",
+        auto_extraction_name,
         auto_extraction_date_header,
     )
 
@@ -2398,10 +2758,34 @@ def import_attachment(
         destination_workbook,
         "DOR",
     )
+    comparison_sheet = None
+    if normalize(selected_queue) == "ecrash":
+        comparison_sheet = find_sheet(
+            destination_workbook,
+            "DOR Comparison",
+        )
+    comparison_mapping = None
+    comparison_excluding_tx_mapping = None
+    if comparison_sheet is not None:
+        comparison_mapping = get_dor_comparison_mapping(
+            comparison_sheet,
+            dor_sheet,
+        )
+        comparison_excluding_tx_mapping = get_dor_comparison_mapping(
+            comparison_sheet,
+            dor_sheet,
+            DOR_COMPARISON_EXCLUDING_TX_SECTION_TITLE,
+        )
     summary_sheet = find_sheet(
         destination_workbook,
         "Summary by date (All states)",
     )
+    summary_sheet_wo_tx = None
+    if comparison_sheet is not None:
+        summary_sheet_wo_tx = find_sheet(
+            destination_workbook,
+            "Summary by Date (wo TX)",
+        )
 
     source_workbook = None
 
@@ -2593,7 +2977,26 @@ def import_attachment(
             production_date,
             cancel_event,
         )
+        summary_values_wo_tx = None
+        wo_tx_pivot_source_ranges = []
+        if summary_sheet_wo_tx is not None:
+            (
+                summary_values_wo_tx,
+                wo_tx_pivot_source_ranges,
+            ) = get_dor_summary_values(
+                summary_sheet_wo_tx,
+                production_date,
+                cancel_event,
+            )
         for pivot_source_range in pivot_source_ranges:
+            pivot_source_range["workbook"] = str(
+                destination_workbook.Name
+            )
+            pivot_source_range["is_highlighted"] = (
+                highlight_imported_data
+            )
+
+        for pivot_source_range in wo_tx_pivot_source_ranges:
             pivot_source_range["workbook"] = str(
                 destination_workbook.Name
             )
@@ -2607,6 +3010,11 @@ def import_attachment(
                     pivot_source_range["first_row"],
                     pivot_source_range["first_column"],
                 ).Interior.Color = pivot_source_range["source_color"]
+            for pivot_source_range in wo_tx_pivot_source_ranges:
+                summary_sheet_wo_tx.Cells(
+                    pivot_source_range["first_row"],
+                    pivot_source_range["first_column"],
+                ).Interior.Color = pivot_source_range["source_color"]
 
         dor_row = append_dor_import_record(
             dor_sheet,
@@ -2614,6 +3022,63 @@ def import_attachment(
             summary_values,
             highlight_imported_data,
         )
+
+        comparison_ranges = []
+        if comparison_sheet is not None:
+            comparison_row = append_dor_comparison_record(
+                comparison_sheet,
+                dor_sheet,
+                dor_row,
+                comparison_mapping,
+                highlight_imported_data,
+            )
+            comparison_range = {
+                "workbook": str(destination_workbook.Name),
+                "sheet": str(comparison_sheet.Name),
+                "kind": "dor_comparison",
+                **comparison_row,
+            }
+            comparison_ranges.append(comparison_range)
+
+            manual_count = summary_values_wo_tx[7]
+            auto_count = summary_values_wo_tx[9]
+            total_count = (manual_count or 0) + (auto_count or 0)
+            manual_share = (
+                manual_count / total_count
+                if total_count
+                else 0
+            )
+            auto_share = (
+                auto_count / total_count
+                if total_count
+                else 0
+            )
+            excluding_tx_source_values = {
+                6: summary_values_wo_tx[3],
+                10: manual_count,
+                11: manual_share,
+                12: summary_values_wo_tx[8],
+                13: auto_count,
+                14: auto_share,
+                15: summary_values_wo_tx[10],
+            }
+            excluding_tx_row = append_dor_comparison_record(
+                comparison_sheet,
+                dor_sheet,
+                dor_row,
+                comparison_excluding_tx_mapping,
+                highlight_imported_data,
+                excluding_tx_source_values,
+                comparison_row["first_row"],
+            )
+            comparison_ranges.append(
+                {
+                    "workbook": str(destination_workbook.Name),
+                    "sheet": str(comparison_sheet.Name),
+                    "kind": "dor_comparison",
+                    **excluding_tx_row,
+                }
+            )
 
         destination_workbook.Save()
 
@@ -2638,7 +3103,10 @@ def import_attachment(
             },
         ]
 
+        highlight_ranges.extend(comparison_ranges)
+
         highlight_ranges.extend(pivot_source_ranges)
+        highlight_ranges.extend(wo_tx_pivot_source_ranges)
 
         return {
             "rows": len(source_rows),
@@ -2654,6 +3122,16 @@ def import_attachment(
             "week": week_value,
             "week_source": week_source,
             "dor_row": dor_row,
+            "dor_comparison_row": (
+                comparison_ranges[0]["first_row"]
+                if comparison_ranges
+                else None
+            ),
+            "dor_comparison_excluding_tx_row": (
+                comparison_ranges[1]["first_row"]
+                if len(comparison_ranges) > 1
+                else None
+            ),
             "day": production_date.strftime(
                 "%A"
             ),

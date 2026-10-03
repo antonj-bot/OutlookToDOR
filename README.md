@@ -91,6 +91,10 @@ leaves column B blank, and copies `H10` and `I10` from `Summary by date (All
 states)` into columns C and D. It writes to row 5 when `DOR!A5` is empty;
 otherwise, it inserts a row at 6.
 
+For `Ecrash` imports, the importer also adds date-matched metrics to both
+sections on `DOR Comparison`. The all-states section uses the DOR summary
+record, while the excluding-TX section uses `Summary by Date (wo TX)`.
+
 Destination workbook and sheet names are configured near the top of `outlook_dor_importer.py` in `DESTINATION_WORKBOOK_NAMES` and `DESTINATION_SHEETS`.
 
 ## Timing Logs
