@@ -49,12 +49,14 @@ python outlook_dor_importer.py
 	reload the mailbox folder list; the default selection is `Inbox`.
 5. Optionally enter an additional filename filter.
 6. Select **Refresh Attachments**.
-7. Select an attachment and confirm the Production Date.
+7. Select one or more attachments. Use the filename date when available;
+	enter a Production Date for attachments whose filenames do not contain one.
 8. Enter a Week override only when needed.
 9. Leave **Insert at row (optional)** blank to append, or enter a row
 	number to insert the imported rows at that position. Existing rows at
 	that position and below move down.
-10. Select **Import Selected Attachment**.
+10. Select **Import Selected Attachments**. Selected files are imported in
+	list order, and each successful import can be undone separately.
 
 When the window is minimized or another application is active, the importer
 flashes its taskbar button and plays an attention sound when refreshing or

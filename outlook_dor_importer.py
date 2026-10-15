@@ -1858,6 +1858,11 @@ def clear_imported_data_highlight(
                         first_row,
                         column_number,
                     ).Interior.Color = source_color
+            elif range_kind == "pivot":
+                worksheet.Cells(
+                    first_row,
+                    first_column,
+                ).Interior.Color = imported_range["source_color"]
             changed_workbooks[workbook_key] = workbook
 
         check_cancelled(cancel_event)

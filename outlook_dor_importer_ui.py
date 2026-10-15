@@ -343,7 +343,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         subtitle_label = ttk.Label(
             main_frame,
             text=(
-                "Choose an Outlook Excel attachment, "
+                "Choose one or more Outlook Excel attachments, "
                 "filter its Work Type, and append it "
                 "to the open DOR workbook."
             ),
@@ -737,6 +737,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 
         self.attachment_listbox = tk.Listbox(
             attachment_frame,
+            selectmode="extended",
             font=(
                 "Consolas",
                 9,
@@ -784,7 +785,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 
         self.import_button = ttk.Button(
             action_frame,
-            text="Import Selected Attachment",
+            text="Import Selected Attachments",
             command=self.run_import,
         )
 
@@ -1486,24 +1487,18 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         self.attachment_selection_changed()
 
 
-    def get_selected_attachment(
+    def get_selected_attachments(
         self,
-    ) -> AttachmentInfo | None:
+    ) -> list[AttachmentInfo]:
         selected_indexes = (
             self
             .attachment_listbox
             .curselection()
         )
 
-        if not selected_indexes:
-            return None
-
-        selected_index = int(
-            selected_indexes[0]
-        )
-
-        return self.attachments[
-            selected_index
+        return [
+            self.attachments[int(index)]
+            for index in selected_indexes
         ]
 
 
@@ -1511,16 +1506,27 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         self,
         _event=None,
     ):
-        attachment = (
-            self.get_selected_attachment()
-        )
+        attachments = self.get_selected_attachments()
 
-        if attachment is None:
+        if not attachments:
+            return
+
+        missing_dates = [
+            attachment
+            for attachment in attachments
+            if extract_date_from_filename(attachment.file_name) is None
+        ]
+        if len(attachments) > 1 and missing_dates:
+            self.production_date_var.set("")
+            self.status_var.set(
+                f"Enter a fallback Production Date for the "
+                f"{len(missing_dates)} selected attachment(s) without a filename date."
+            )
             return
 
         detected_date = (
             extract_date_from_filename(
-                attachment.file_name
+                attachments[0].file_name
             )
         )
 
@@ -1559,14 +1565,12 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         if self.action_active:
             return
 
-        selected_attachment = (
-            self.get_selected_attachment()
-        )
+        selected_attachments = self.get_selected_attachments()
 
-        if selected_attachment is None:
+        if not selected_attachments:
             messagebox.showwarning(
                 "No attachment",
-                "Select an attachment first.",
+                "Select one or more attachments first.",
             )
 
             return
@@ -1586,18 +1590,21 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 
             return
 
-        try:
-            production_date = parse_date(
-                self.production_date_var.get()
-            )
-
-        except ValueError as error:
-            messagebox.showerror(
-                "Invalid date",
-                str(error),
-            )
-
-            return
+        fallback_date = None
+        if any(
+            extract_date_from_filename(attachment.file_name) is None
+            for attachment in selected_attachments
+        ):
+            try:
+                fallback_date = parse_date(
+                    self.production_date_var.get()
+                )
+            except ValueError as error:
+                messagebox.showerror(
+                    "Invalid date",
+                    str(error),
+                )
+                return
 
         row_override_text = self.row_override_var.get().strip()
         row_override = None
@@ -1625,17 +1632,15 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         self.set_busy(True)
         self.update_progress(
             10,
-            f'Downloading "'
-            f'{selected_attachment.file_name}'
-            f'" from Outlook...'
+            f"Preparing {len(selected_attachments)} attachment(s)..."
         )
 
         threading.Thread(
             target=self._import_worker,
             args=(
-                selected_attachment,
+                selected_attachments,
                 destination_name,
-                production_date,
+                fallback_date,
                 self.queue_var.get(),
                 self.week_override_var.get(),
                 row_override,
@@ -1646,96 +1651,121 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 
     def _import_worker(
         self,
-        selected_attachment: AttachmentInfo,
+        selected_attachments: list[AttachmentInfo],
         destination_name: str,
-        production_date: date,
+        fallback_date: date | None,
         selected_queue: str,
         week_override: str,
         row_override: int | None,
         highlight_imported_data: bool,
     ):
-        result = None
+        completed_imports = []
         error = None
         process_started_at = self.session_timer.start()
-        stage_durations = {}
+        attachment_count = len(selected_attachments)
 
         com_initialized = False
         try:
             pythoncom.CoInitialize()
             com_initialized = True
 
-            download_started_at = self.session_timer.start()
+            inserted_rows = 0
+            for attachment_index, attachment in enumerate(selected_attachments):
+                check_cancelled(self.cancel_event)
+                attachment_started_at = self.session_timer.start()
+                stage_durations = {}
+                production_date = (
+                    extract_date_from_filename(attachment.file_name)
+                    or fallback_date
+                )
+                if production_date is None:
+                    raise ValueError(
+                        f'No production date was detected for "{attachment.file_name}".'
+                    )
 
-            try:
-                downloaded_path = save_attachment(
-                    selected_attachment,
-                    self.cancel_event,
+                progress = int(10 + 85 * attachment_index / attachment_count)
+                self.post_ui_event(
+                    self.update_progress,
+                    progress,
+                    f'Downloading "{attachment.file_name}"...',
                 )
-            except Exception as caught_error:
-                was_cancelled = isinstance(
-                    caught_error,
-                    ProcessCancelled,
-                )
-                stage_durations["Download attachment"] = (
-                    self.session_timer.finish(
+                download_started_at = self.session_timer.start()
+                try:
+                    downloaded_path = save_attachment(
+                        attachment,
+                        self.cancel_event,
+                    )
+                except Exception as caught_error:
+                    was_cancelled = isinstance(caught_error, ProcessCancelled)
+                    stage_durations["Download attachment"] = self.session_timer.finish(
                         "Download attachment",
                         download_started_at,
                         was_cancelled,
                         None if was_cancelled else caught_error,
                     )
-                )
-                raise
-            else:
-                stage_durations["Download attachment"] = (
-                    self.session_timer.finish(
+                    raise
+                else:
+                    stage_durations["Download attachment"] = self.session_timer.finish(
                         "Download attachment",
                         download_started_at,
                         True,
                     )
-                )
 
-            check_cancelled(self.cancel_event)
-            self.post_ui_event(
-                self.update_progress,
-                45,
-                "Copying attachment contents...",
-            )
-
-            import_started_at = self.session_timer.start()
-
-            try:
-                result = import_attachment(
-                    source_path=downloaded_path,
-                    selected_queue=selected_queue,
-                    destination_workbook_name=destination_name,
-                    production_date=production_date,
-                    week_override=week_override,
-                    row_override=row_override,
-                    cancel_event=self.cancel_event,
-                    highlight_imported_data=highlight_imported_data,
+                check_cancelled(self.cancel_event)
+                self.post_ui_event(
+                    self.update_progress,
+                    int(10 + 85 * (attachment_index + 0.5) / attachment_count),
+                    f'Importing "{attachment.file_name}"...',
                 )
-            except Exception as caught_error:
-                was_cancelled = isinstance(
-                    caught_error,
-                    ProcessCancelled,
+                import_started_at = self.session_timer.start()
+                current_row_override = (
+                    row_override + inserted_rows
+                    if row_override is not None
+                    else None
                 )
-                stage_durations["Copy into Excel"] = (
-                    self.session_timer.finish(
+                try:
+                    result = import_attachment(
+                        source_path=downloaded_path,
+                        selected_queue=selected_queue,
+                        destination_workbook_name=destination_name,
+                        production_date=production_date,
+                        week_override=week_override,
+                        row_override=current_row_override,
+                        cancel_event=self.cancel_event,
+                        highlight_imported_data=highlight_imported_data,
+                    )
+                except Exception as caught_error:
+                    was_cancelled = isinstance(caught_error, ProcessCancelled)
+                    stage_durations["Copy into Excel"] = self.session_timer.finish(
                         "Copy into Excel",
                         import_started_at,
                         was_cancelled,
                         None if was_cancelled else caught_error,
                     )
-                )
-                raise
-            else:
-                stage_durations["Copy into Excel"] = (
-                    self.session_timer.finish(
+                    raise
+                else:
+                    stage_durations["Copy into Excel"] = self.session_timer.finish(
                         "Copy into Excel",
                         import_started_at,
                         True,
                     )
+
+                item_duration = self.session_timer.finish(
+                    f"Import {attachment.file_name}",
+                    attachment_started_at,
+                    True,
                 )
+                completed_imports.append(
+                    (
+                        attachment,
+                        result,
+                        stage_durations,
+                        item_duration,
+                        current_row_override,
+                    )
+                )
+                if current_row_override is not None:
+                    inserted_rows += result["rows"]
 
         except Exception as caught_error:
             error = caught_error
@@ -1745,20 +1775,87 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                 pythoncom.CoUninitialize()
 
         duration_seconds = self.session_timer.finish(
-            "Import Selected Attachment",
+            "Import Selected Attachments",
             process_started_at,
             error is None or isinstance(error, ProcessCancelled),
             None if isinstance(error, ProcessCancelled) else error,
         )
 
         self.post_ui_event(
-            self._finish_import,
-            result,
+            self._finish_import_batch,
+            completed_imports,
             error,
             duration_seconds,
-            stage_durations,
-            row_override,
+            attachment_count,
         )
+
+    def _finish_import_batch(
+        self,
+        completed_imports: list[tuple],
+        error: Exception | None,
+        duration_seconds: float,
+        attachment_count: int,
+    ):
+        if not completed_imports:
+            self.set_busy(False)
+            if isinstance(error, ProcessCancelled):
+                self.set_activity("Import cancelled")
+                self.status_var.set(
+                    "Import cancelled before destination data was changed."
+                )
+            elif error is not None:
+                self.set_activity("Import failed")
+                self.show_error("Import failed", error)
+            return
+
+        summaries = []
+        for attachment, result, stage_durations, _item_duration, used_row_override in completed_imports:
+            result["import_id"] = id(result)
+            self._record_imported_range(result, used_row_override)
+            self.import_records.append(
+                {
+                    "import_id": result["import_id"],
+                    "result": result,
+                    "row_override": used_row_override,
+                    "raw_row_segments": [(result["first_row"], result["last_row"])],
+                    "dor_sheet": "DOR",
+                    "dor_row": result["dor_row"],
+                    "dor_row_inserted": result["dor_row_inserted"],
+                }
+            )
+            self.imported_data_highlighted = (
+                self.imported_data_highlighted
+                or result["highlight_imported_data"]
+            )
+            summaries.append(
+                f"{attachment.file_name}: {result['rows']} row(s), "
+                f"{result['production_date']}, "
+                f"{stage_durations['Download attachment']:.2f}s download, "
+                f"{stage_durations['Copy into Excel']:.2f}s import"
+            )
+
+        summary = (
+            f"Imported {len(completed_imports)} of {attachment_count} "
+            f"attachment(s) in {duration_seconds:.2f} seconds.\n\n"
+            + "\n".join(summaries)
+        )
+        if error is not None:
+            summary += f"\n\nStopped because: {error}"
+
+        self.notify_action_complete(
+            "Excel import finished",
+            f"{len(completed_imports)} attachment(s) processed.",
+        )
+        self.update_progress(100, summary)
+        self.set_activity(
+            "Import completed" if error is None else "Batch import stopped",
+            done=True,
+        )
+        self.set_busy(False)
+        if error is not None:
+            messagebox.showwarning("Batch Import Partially Completed", summary)
+        else:
+            messagebox.showinfo("Import Complete", summary)
 
     def toggle_imported_data_highlight(self):
         if self.imported_data_highlighted:
@@ -2137,110 +2234,6 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                     import_record["dor_row"] += inserted_row_count
 
         self.imported_ranges.extend(ranges_to_add)
-
-    def _finish_import(
-        self,
-        result,
-        error,
-        duration_seconds: float,
-        stage_durations: dict[str, float],
-        row_override: int | None,
-    ):
-        if isinstance(error, ProcessCancelled):
-            self.set_activity("Import cancelled")
-            self.status_var.set(
-                "Import cancelled before the destination data was changed."
-            )
-            self.set_busy(False)
-            return
-
-        if error is not None:
-            self.set_activity("Import failed")
-            self.notify_action_complete(
-                "Excel import failed",
-                "The selected report could not be imported.",
-            )
-            self.status_var.set(
-                f"Import failed after {duration_seconds:.2f} seconds."
-            )
-            self.show_error(
-                "Import failed",
-                error,
-            )
-            self.set_busy(False)
-            return
-
-        result["import_id"] = id(result)
-        self._record_imported_range(
-            result,
-            row_override,
-        )
-        self.import_records.append(
-            {
-                "import_id": result["import_id"],
-                "result": result,
-                "row_override": row_override,
-                "raw_row_segments": [
-                    (result["first_row"], result["last_row"])
-                ],
-                "dor_sheet": "DOR",
-                "dor_row": result["dor_row"],
-                "dor_row_inserted": result["dor_row_inserted"],
-            }
-        )
-        self.imported_data_highlighted = (
-            self.imported_data_highlighted
-            or result["highlight_imported_data"]
-        )
-
-        self.notify_action_complete(
-            "Excel import finished",
-            "The selected report has finished processing.",
-        )
-
-        self.update_progress(
-            100,
-            "Import completed successfully."
-        )
-
-        summary = (
-            "Import completed successfully.\n\n"
-            f"Workbook: {result['workbook']}\n"
-            f"Sheet: {result['sheet']}\n"
-            f"Rows imported: {result['rows']}\n"
-            f"Columns imported: {result['columns']}\n"
-            f"Import started at row: {result['first_row']}\n"
-            f"Destination rows: "
-            f"{result['first_row']} to "
-            f"{result['last_row']}\n"
-            f"DOR summary row: {result['dor_row']}\n"
-            f"Week: {result['week']} "
-            f"({result['week_source']})\n"
-            f"Day: {result['day']}\n"
-            f"Production Date: "
-            f"{result['production_date']}\n"
-            f"Download time: "
-            f"{stage_durations['Download attachment']:.2f} seconds\n"
-            f"Excel copy time: "
-            f"{stage_durations['Copy into Excel']:.2f} seconds\n"
-            f"Total import time: {duration_seconds:.2f} seconds"
-        )
-
-        if self.cancel_event.is_set():
-            summary += (
-                "\n\nCancellation was requested while Excel was "
-                "writing data, so this import finished before stopping."
-            )
-
-        self.status_var.set(summary)
-        self.set_activity("Import completed", done=True)
-
-        self.set_busy(False)
-
-        messagebox.showinfo(
-            "Import Complete",
-            summary,
-        )
 
     def close_application(self):
         if self.action_active:
