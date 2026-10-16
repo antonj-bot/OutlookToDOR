@@ -14,25 +14,23 @@ import pythoncom
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from outlook_dor_importer import (
-    AttachmentInfo,
-    DESTINATION_WORKBOOK_NAMES,
-    ProcessCancelled,
-    SessionTimer,
-    check_cancelled,
+from backend.config import DESTINATION_WORKBOOK_NAMES
+from backend.exceptions import ProcessCancelled, check_cancelled
+from backend.excel.highlighting import (
     clear_imported_data_highlight,
-    extract_date_from_filename,
-    filter_outlook_folder_choices,
-    get_outlook_namespace,
     highlight_imported_data_ranges,
-    import_attachment,
-    list_excel_attachments,
-    list_outlook_folder_paths,
-    logger,
-    parse_date,
-    save_attachment,
-    undo_imported_data,
 )
+from backend.excel.source_reader import extract_date_from_filename, parse_date
+from backend.excel.undo import undo_imported_data
+from backend.logging_setup import logger
+from backend.models import AttachmentInfo, SessionTimer
+from backend.outlook.attachments import list_excel_attachments, save_attachment
+from backend.outlook.connection import get_outlook_namespace
+from backend.outlook.folders import (
+    filter_outlook_folder_choices,
+    list_outlook_folder_paths,
+)
+from backend.services.import_service import import_attachment
 
 FLASHW_TRAY = 0x00000002
 FLASHW_TIMERNOFG = 0x0000000C
@@ -68,8 +66,13 @@ class OutlookDORImporterApp(tk.Tk):
         self.attachments: list[
             AttachmentInfo
         ] = []
+        self.checked_attachment_indexes: set[int] = set()
         self.imported_ranges: list[dict] = []
         self.import_records: list[dict] = []
+        self.import_batch_counter = 0
+        self.undo_batch_id: int | None = None
+        self.undo_batch_total = 0
+        self.undo_batch_completed = 0
         self.imported_data_highlighted = False
 
         self.queue_var = tk.StringVar(
@@ -108,6 +111,9 @@ class OutlookDORImporterApp(tk.Tk):
             tk.StringVar()
         )
         self.highlight_imported_var = tk.BooleanVar(
+            value=False
+        )
+        self.batch_import_var = tk.BooleanVar(
             value=False
         )
 
@@ -735,15 +741,16 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             pady=(14, 10),
         )
 
-        self.attachment_listbox = tk.Listbox(
+        self.attachment_listbox = ttk.Treeview(
             attachment_frame,
+            columns=("include", "attachment"),
+            show="headings",
             selectmode="extended",
-            font=(
-                "Consolas",
-                9,
-            ),
-            activestyle="dotbox",
         )
+        self.attachment_listbox.heading("include", text="")
+        self.attachment_listbox.heading("attachment", text="Attachment")
+        self.attachment_listbox.column("include", width=64, stretch=False, anchor="center")
+        self.attachment_listbox.column("attachment", width=850, stretch=True)
 
         attachment_scrollbar = ttk.Scrollbar(
             attachment_frame,
@@ -773,8 +780,12 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         )
 
         self.attachment_listbox.bind(
-            "<<ListboxSelect>>",
+            "<<TreeviewSelect>>",
             self.attachment_selection_changed,
+        )
+        self.attachment_listbox.bind(
+            "<Button-1>",
+            self.attachment_checkbox_clicked,
         )
 
         action_frame = ttk.Frame(main_frame)
@@ -787,6 +798,13 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             action_frame,
             text="Import Selected Attachments",
             command=self.run_import,
+        )
+
+        self.batch_import_checkbutton = ttk.Checkbutton(
+            action_frame,
+            text="Batch/mass import",
+            variable=self.batch_import_var,
+            command=self.batch_import_mode_changed,
         )
 
         self.highlight_imported_checkbutton = ttk.Checkbutton(
@@ -809,7 +827,18 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             state="disabled",
         )
 
+        self.undo_batch_button = ttk.Button(
+            action_frame,
+            text="Undo Last Batch",
+            command=self.undo_last_batch,
+            state="disabled",
+        )
+
         self.highlight_imported_checkbutton.pack(
+            side="left",
+            padx=(0, 12),
+        )
+        self.batch_import_checkbutton.pack(
             side="left",
             padx=(0, 12),
         )
@@ -823,6 +852,10 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         )
         self.undo_import_button.pack(
             side="left",
+        )
+        self.undo_batch_button.pack(
+            side="left",
+            padx=(6, 0),
         )
         
         progress_frame = ttk.Frame(
@@ -922,6 +955,9 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             self.undo_import_button.configure(
                 state="disabled"
             )
+            self.undo_batch_button.configure(
+                state="disabled"
+            )
             self.refresh_folders_button.configure(
                 state="disabled"
             )
@@ -953,6 +989,18 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             )
             self.undo_import_button.configure(
                 state=("normal" if self.import_records else "disabled")
+            )
+            latest_batch_id = (
+                self.import_records[-1].get("batch_id")
+                if self.import_records
+                else None
+            )
+            latest_batch_count = sum(
+                record.get("batch_id") == latest_batch_id
+                for record in self.import_records
+            )
+            self.undo_batch_button.configure(
+                state=("normal" if latest_batch_count > 1 else "disabled")
             )
             self.refresh_folders_button.configure(
                 state="normal"
@@ -1419,15 +1467,20 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             "Loading matching attachments..."
         )
 
+        self.checked_attachment_indexes.clear()
         self.attachment_listbox.delete(
-            0,
-            tk.END,
+            *self.attachment_listbox.get_children(),
         )
 
-        for attachment in self.attachments:
+        for index, attachment in enumerate(self.attachments):
             self.attachment_listbox.insert(
+                "",
                 tk.END,
-                attachment.display_name,
+                iid=str(index),
+                values=(
+                    "[ ]" if self.batch_import_var.get() else "",
+                    attachment.display_name,
+                ),
             )
 
         self.update_progress(
@@ -1467,38 +1520,98 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             self.refresh_attachments()
             return
 
-        self.attachment_listbox.selection_clear(
-            0,
-            tk.END,
-        )
+        if self.batch_import_var.get():
+            self.checked_attachment_indexes = {0}
+            self._refresh_attachment_checkbox_labels()
+        else:
+            selected_items = self.attachment_listbox.selection()
+            if selected_items:
+                self.attachment_listbox.selection_remove(*selected_items)
+            self.attachment_listbox.selection_set("0")
 
-        self.attachment_listbox.selection_set(
-            0
-        )
-
-        self.attachment_listbox.activate(
-            0
-        )
-
-        self.attachment_listbox.see(
-            0
-        )
+        self.attachment_listbox.focus("0")
+        self.attachment_listbox.see("0")
 
         self.attachment_selection_changed()
+
+    def batch_import_mode_changed(self):
+        if self.batch_import_var.get():
+            self.checked_attachment_indexes = {
+                int(item_id)
+                for item_id in self.attachment_listbox.selection()
+            }
+        else:
+            selected_items = self.attachment_listbox.selection()
+            if selected_items:
+                self.attachment_listbox.selection_remove(*selected_items)
+            for index in sorted(self.checked_attachment_indexes):
+                item_id = str(index)
+                if self.attachment_listbox.exists(item_id):
+                    self.attachment_listbox.selection_add(item_id)
+
+        self._refresh_attachment_checkbox_labels()
+        self.attachment_listbox.heading(
+            "include",
+            text="Include" if self.batch_import_var.get() else "",
+        )
+        self.import_button.configure(
+            text=(
+                "Import Checked Attachments"
+                if self.batch_import_var.get()
+                else "Import Selected Attachments"
+            )
+        )
+        self.attachment_selection_changed()
+
+    def _refresh_attachment_checkbox_labels(self):
+        for item_id in self.attachment_listbox.get_children():
+            index = int(item_id)
+            include_marker = (
+                "[x]"
+                if index in self.checked_attachment_indexes
+                else "[ ]"
+            ) if self.batch_import_var.get() else ""
+            self.attachment_listbox.set(
+                item_id,
+                "include",
+                include_marker,
+            )
+
+    def attachment_checkbox_clicked(self, event):
+        if not self.batch_import_var.get():
+            return
+
+        item_id = self.attachment_listbox.identify_row(event.y)
+        column_id = self.attachment_listbox.identify_column(event.x)
+        if not item_id or column_id != "#1":
+            return
+
+        index = int(item_id)
+        if index in self.checked_attachment_indexes:
+            self.checked_attachment_indexes.remove(index)
+        else:
+            self.checked_attachment_indexes.add(index)
+
+        self._refresh_attachment_checkbox_labels()
+        self.attachment_selection_changed()
+        return "break"
 
 
     def get_selected_attachments(
         self,
     ) -> list[AttachmentInfo]:
-        selected_indexes = (
-            self
-            .attachment_listbox
-            .curselection()
-        )
+        if self.batch_import_var.get():
+            selected_indexes = sorted(self.checked_attachment_indexes)
+        else:
+            selected_indexes = sorted(
+                int(item_id)
+                for item_id in self.attachment_listbox.selection()
+            )
 
         return [
-            self.attachments[int(index)]
+            self.attachments[index]
             for index in selected_indexes
+            if 0 <= index < len(self.attachments)
         ]
 
 
@@ -1809,12 +1922,15 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             return
 
         summaries = []
+        self.import_batch_counter += 1
+        batch_id = self.import_batch_counter
         for attachment, result, stage_durations, _item_duration, used_row_override in completed_imports:
             result["import_id"] = id(result)
             self._record_imported_range(result, used_row_override)
             self.import_records.append(
                 {
                     "import_id": result["import_id"],
+                    "batch_id": batch_id,
                     "result": result,
                     "row_override": used_row_override,
                     "raw_row_segments": [(result["first_row"], result["last_row"])],
@@ -2016,42 +2132,148 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             else:
                 remaining_ranges.append(dict(imported_range))
 
-        if import_record["row_override"] is not None:
-            first_inserted_row = import_result["first_row"]
-            first_row_after_insert = (
-                first_inserted_row + import_result["rows"]
+        deleted_raw_segments = import_record["raw_row_segments"]
+        for imported_range in remaining_ranges:
+            if (
+                imported_range.get("kind") == "raw"
+                and imported_range["workbook"].casefold()
+                == import_result["workbook"].casefold()
+                and imported_range["sheet"].casefold()
+                == import_result["sheet"].casefold()
+            ):
+                deleted_rows_before_range = sum(
+                    last_row - first_row + 1
+                    for first_row, last_row in deleted_raw_segments
+                    if last_row < imported_range["first_row"]
+                )
+                imported_range["first_row"] -= deleted_rows_before_range
+                imported_range["last_row"] -= deleted_rows_before_range
+
+        for imported_range in remaining_ranges:
+            if (
+                imported_range.get("kind") == "dor"
+                and imported_range["workbook"].casefold()
+                == import_result["workbook"].casefold()
+                and imported_range["first_row"] > import_record["dor_row"]
+            ):
+                imported_range["first_row"] -= 1
+                imported_range["last_row"] -= 1
+
+        deleted_comparison_rows = {
+            (
+                imported_range["workbook"].casefold(),
+                imported_range["sheet"].casefold(),
+                imported_range["first_row"],
+                imported_range["last_row"],
             )
-
-            for imported_range in remaining_ranges:
-                if (
-                    imported_range.get("kind") == "raw"
-                    and imported_range["workbook"].casefold()
-                    == import_result["workbook"].casefold()
-                    and imported_range["sheet"].casefold()
-                    == import_result["sheet"].casefold()
-                    and imported_range["first_row"] >= first_row_after_insert
-                ):
-                    imported_range["first_row"] -= import_result["rows"]
-                    imported_range["last_row"] -= import_result["rows"]
-
-        if import_record["dor_row_inserted"]:
-            for imported_range in remaining_ranges:
-                if (
-                    imported_range.get("kind") == "dor"
-                    and imported_range["workbook"].casefold()
-                    == import_result["workbook"].casefold()
-                    and imported_range["first_row"] > import_record["dor_row"]
-                ):
-                    imported_range["first_row"] -= 1
-                    imported_range["last_row"] -= 1
+            for imported_range in ranges_to_remove
+            if imported_range.get("kind") == "dor_comparison"
+            and imported_range.get("row_inserted")
+        }
+        for imported_range in remaining_ranges:
+            if imported_range.get("kind") != "dor_comparison":
+                continue
+            deleted_rows_before_range = sum(
+                last_row - first_row + 1
+                for workbook_name, sheet_name, first_row, last_row
+                in deleted_comparison_rows
+                if workbook_name == imported_range["workbook"].casefold()
+                and sheet_name == imported_range["sheet"].casefold()
+                and last_row < imported_range["first_row"]
+            )
+            imported_range["first_row"] -= deleted_rows_before_range
+            imported_range["last_row"] -= deleted_rows_before_range
 
         return ranges_to_remove, remaining_ranges
+
+    def _sync_import_record_positions(
+        self,
+        imported_ranges: list[dict],
+    ):
+        for import_record in self.import_records:
+            import_id = import_record["import_id"]
+            record_ranges = [
+                item
+                for item in imported_ranges
+                if item.get("import_id") == import_id
+            ]
+            raw_ranges = sorted(
+                (
+                    item
+                    for item in record_ranges
+                    if item.get("kind") == "raw"
+                ),
+                key=lambda item: item["first_row"],
+            )
+            if raw_ranges:
+                import_record["raw_row_segments"] = [
+                    (item["first_row"], item["last_row"])
+                    for item in raw_ranges
+                ]
+                import_record["result"]["first_row"] = raw_ranges[0]["first_row"]
+                import_record["result"]["last_row"] = raw_ranges[-1]["last_row"]
+
+            dor_ranges = [
+                item
+                for item in record_ranges
+                if item.get("kind") == "dor"
+            ]
+            if dor_ranges:
+                import_record["dor_row"] = dor_ranges[0]["first_row"]
+                import_record["result"]["dor_row"] = dor_ranges[0]["first_row"]
 
     def undo_last_import(self):
         if self.action_active or not self.import_records:
             return
 
-        import_record = self.import_records[-1]
+        self._start_undo_import(self.import_records[-1])
+
+    def undo_last_batch(self):
+        if self.action_active or len(self.import_records) < 2:
+            return
+
+        batch_id = self.import_records[-1].get("batch_id")
+        batch_count = sum(
+            record.get("batch_id") == batch_id
+            for record in self.import_records
+        )
+        if batch_count < 2:
+            return
+        if not messagebox.askyesno(
+            "Undo Last Batch",
+            f"Undo all {batch_count} imports from the latest batch?",
+        ):
+            return
+
+        self.undo_batch_id = batch_id
+        self.undo_batch_total = batch_count
+        self.undo_batch_completed = 0
+        self._undo_next_batch_import()
+
+    def _undo_next_batch_import(self):
+        if self.action_active or self.undo_batch_id is None:
+            return
+        if self.cancel_event.is_set():
+            completed = self.undo_batch_completed
+            total = self.undo_batch_total
+            self._clear_undo_batch_state()
+            self.set_busy(False)
+            self.set_activity("Batch undo cancelled")
+            self.status_var.set(
+                f"Batch undo cancelled after {completed} of {total} import(s)."
+            )
+            return
+        if (
+            not self.import_records
+            or self.import_records[-1].get("batch_id") != self.undo_batch_id
+        ):
+            self._clear_undo_batch_state()
+            self.set_busy(False)
+            return
+
+        self._start_undo_import(self.import_records[-1])
+
+    def _start_undo_import(self, import_record: dict):
         ranges_to_remove, remaining_ranges = self._ranges_after_undo(
             import_record
         )
@@ -2061,7 +2283,13 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         )
 
         self.set_busy(True)
-        self.set_activity("Undoing the last import...")
+        if self.undo_batch_id is not None:
+            self.set_activity(
+                f"Undoing batch import {self.undo_batch_completed + 1} "
+                f"of {self.undo_batch_total}..."
+            )
+        else:
+            self.set_activity("Undoing the last import...")
         threading.Thread(
             target=self._undo_last_import_worker,
             args=(
@@ -2117,10 +2345,22 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         error: Exception | None,
     ):
         if error is not None:
+            batch_completed = self.undo_batch_completed
+            batch_total = self.undo_batch_total
+            is_batch_undo = self.undo_batch_id is not None
+            self._clear_undo_batch_state()
             self.set_busy(False)
             if isinstance(error, ProcessCancelled):
                 self.set_activity("Undo cancelled")
-                self.status_var.set("Undo cancelled before data was removed.")
+                if is_batch_undo:
+                    self.status_var.set(
+                        f"Batch undo cancelled after {batch_completed} "
+                        f"of {batch_total} import(s)."
+                    )
+                else:
+                    self.status_var.set(
+                        "Undo cancelled before data was removed."
+                    )
             else:
                 self.set_activity("Undo failed")
                 self.show_error("Could not undo the last import", error)
@@ -2129,12 +2369,45 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         self.imported_ranges = remaining_ranges
         if self.import_records and self.import_records[-1]["import_id"] == import_record["import_id"]:
             self.import_records.pop()
+        self._sync_import_record_positions(self.imported_ranges)
         self.imported_data_highlighted = rehighlight_remaining
+
+        if (
+            self.undo_batch_id is not None
+            and import_record.get("batch_id") == self.undo_batch_id
+        ):
+            self.undo_batch_completed += 1
+            if (
+                self.import_records
+                and self.import_records[-1].get("batch_id") == self.undo_batch_id
+            ):
+                self.set_busy(False)
+                self.status_var.set(
+                    f"Undid {self.undo_batch_completed} of "
+                    f"{self.undo_batch_total} imports; continuing batch undo..."
+                )
+                self._undo_next_batch_import()
+                return
+
+            completed = self.undo_batch_completed
+            self._clear_undo_batch_state()
+            self.set_busy(False)
+            self.status_var.set(
+                f"Undid all {completed} imports from the latest batch."
+            )
+            self.set_activity("Batch imports undone", done=True)
+            return
+
         self.set_busy(False)
         self.status_var.set(
             "Undid the last import and refreshed the summary pivots."
         )
         self.set_activity("Last import undone", done=True)
+
+    def _clear_undo_batch_state(self):
+        self.undo_batch_id = None
+        self.undo_batch_total = 0
+        self.undo_batch_completed = 0
 
     def _record_imported_range(
         self,
@@ -2159,6 +2432,21 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             row_insertions.append(
                 (dor_range["sheet"], result["dor_row"], 1)
             )
+
+        for imported_range in ranges_to_add:
+            if (
+                imported_range.get("kind") == "dor_comparison"
+                and imported_range.get("row_inserted")
+            ):
+                comparison_insertion = (
+                    imported_range["sheet"],
+                    imported_range["first_row"],
+                    imported_range["last_row"]
+                    - imported_range["first_row"]
+                    + 1,
+                )
+                if comparison_insertion not in row_insertions:
+                    row_insertions.append(comparison_insertion)
 
         for sheet_name, insert_row, inserted_row_count in row_insertions:
             updated_ranges = []
@@ -2234,6 +2522,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                     import_record["dor_row"] += inserted_row_count
 
         self.imported_ranges.extend(ranges_to_add)
+        self._sync_import_record_positions(self.imported_ranges)
 
     def close_application(self):
         if self.action_active:

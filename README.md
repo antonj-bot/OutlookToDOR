@@ -6,6 +6,8 @@ A Windows desktop utility that finds qualifying Excel attachments in Outlook and
 ## What It Does
 
 - Searches an Outlook folder for recent Excel attachments.
+- Opens each source attachment read-only and keeps its workbook window hidden
+	while it is imported.
 - Only shows attachments whose filename contains `Individual Keyed Pass per User`.
 - Supports an additional optional filename filter.
 - Filters source rows by queue:
@@ -49,14 +51,17 @@ python outlook_dor_importer.py
 	reload the mailbox folder list; the default selection is `Inbox`.
 5. Optionally enter an additional filename filter.
 6. Select **Refresh Attachments**.
-7. Select one or more attachments. Use the filename date when available;
-	enter a Production Date for attachments whose filenames do not contain one.
+7. Select one or more attachments. To prepare a batch, enable
+	**Batch/mass import** and tick each attachment to include. Use the filename
+	date when available; enter a Production Date for attachments whose filenames
+	do not contain one.
 8. Enter a Week override only when needed.
 9. Leave **Insert at row (optional)** blank to append, or enter a row
 	number to insert the imported rows at that position. Existing rows at
 	that position and below move down.
-10. Select **Import Selected Attachments**. Selected files are imported in
-	list order, and each successful import can be undone separately.
+10. Select **Import Selected Attachments** or **Import Checked Attachments**.
+	Files are imported in list order. Use **Undo Last Import** to undo one file,
+	or **Undo Last Batch** to undo every successful import from the latest run.
 
 When the window is minimized or another application is active, the importer
 flashes its taskbar button and plays an attention sound when refreshing or
@@ -136,8 +141,12 @@ Ensure Outlook and Excel are installed as desktop applications, close unexpected
 
 | File | Purpose |
 | --- | --- |
-| `outlook_dor_importer.py` | Outlook/Excel import logic and application launcher |
+| `outlook_dor_importer.py` | Compatibility exports and application launcher |
 | `outlook_dor_importer_ui.py` | Tkinter user interface |
+| `backend/config.py` | Workbook, queue, and Excel constants |
+| `backend/outlook/` | Outlook connection, folder, and attachment operations |
+| `backend/excel/` | Excel source reading, destination writes, summaries, highlighting, and undo |
+| `backend/services/import_service.py` | Coordinates importing one attachment |
 | `LICENSE` | MIT license |
 
 ## License
