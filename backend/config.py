@@ -1,5 +1,7 @@
 """Application and Office constants used across the importer."""
 
+OL_EMBEDDED_ITEM = 5
+
 DESTINATION_WORKBOOK_NAMES = {
     "Ecrash": "Ecrash_Jan 2026_DOR_V2_Anton",
     "CGF": "CGF_Jan 2026_DOR_V2_Anton",
@@ -23,10 +25,16 @@ ALLOWED_EXCEL_EXTENSIONS = {
     ".xlsb",
     ".xls",
 }
+
+ALLOWED_OUTLOOK_ITEM_EXTENSIONS = {
+    ".msg",
+    ".eml",
+}
+
 OUTLOOK_MESSAGE_LIMIT = 500
 
 REQUIRED_ATTACHMENT_KEYWORD = (
-    "individual"
+    ""
 )
 required_keyword = REQUIRED_ATTACHMENT_KEYWORD.strip().casefold()
 
@@ -69,3 +77,4 @@ DOR_COMPARISON_EXCLUDING_TX_SECTION_TITLE = (
     "ECRASH - MANUAL VS AUTO (EXCLUDING TX)"
 )
 DOR_HEADER_ROWS = (2, 3, 4)
+
