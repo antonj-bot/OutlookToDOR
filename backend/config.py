@@ -24,9 +24,12 @@ ALLOWED_EXCEL_EXTENSIONS = {
     ".xls",
 }
 OUTLOOK_MESSAGE_LIMIT = 500
+
 REQUIRED_ATTACHMENT_KEYWORD = (
-    "individual keyed pass per user"
+    "individual"
 )
+required_keyword = REQUIRED_ATTACHMENT_KEYWORD.strip().casefold()
+
 OL_FOLDER_INBOX = 6
 XL_UP = -4162
 XL_TO_LEFT = -4159
