@@ -2396,7 +2396,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             self.status_var.set(
                 f"Undid all {completed} imports from the latest batch."
             )
-            self.set_activity("Batch imports removene", done=True)
+            self.set_activity("Removed last batch imports", done=True)
             return
 
         self.set_busy(False)
