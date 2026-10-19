@@ -14,7 +14,10 @@ import pythoncom
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from backend.config import DESTINATION_WORKBOOK_NAMES
+from backend.config import (
+    DESTINATION_WORKBOOK_NAMES,
+    REQUIRED_ATTACHMENT_KEYWORD,
+)
 from backend.exceptions import ProcessCancelled, check_cancelled
 from backend.excel.highlighting import (
     clear_imported_data_highlight,
@@ -77,6 +80,9 @@ class OutlookDORImporterApp(tk.Tk):
 
         self.queue_var = tk.StringVar(
             value="Ecrash"
+        )
+        self.required_keyword_var = tk.StringVar(
+            value=REQUIRED_ATTACHMENT_KEYWORD
         )
 
         self.file_filter_var = tk.StringVar()
@@ -550,7 +556,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 
         ttk.Label(
             settings_frame,
-            text="Additional filename filter:",
+            text="Required attachment keyword:",
         ).grid(
             row=1,
             column=0,
@@ -558,14 +564,13 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             pady=5,
         )
 
-        file_filter_entry = ttk.Entry(
+        required_keyword_entry = ttk.Entry(
             settings_frame,
-            textvariable=(
-                self.file_filter_var
-            ),
+            textvariable=self.required_keyword_var
         )
+        
 
-        file_filter_entry.grid(
+        required_keyword_entry.grid(
             row=1,
             column=1,
             columnspan=2,
@@ -573,7 +578,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             padx=(8, 0),
             pady=5,
         )
-
+        
         self.refresh_attachments_button = ttk.Button(
             settings_frame,
             text="Refresh Attachments",
@@ -1358,7 +1363,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         )
         self.set_activity("Outlook folders loaded", done=True)
 
-
+    
     def refresh_attachments(self):
         if self.action_active:
             return
@@ -1374,15 +1379,17 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         threading.Thread(
             target=self._refresh_attachments_worker,
             args=(
+                self.required_keyword_var.get(),
                 self.file_filter_var.get(),
                 folder_path,
                 self.cancel_event,
             ),
             daemon=True,
         ).start()
-
+        
     def _refresh_attachments_worker(
         self,
+        required_keyword: str,
         file_name_filter: str,
         folder_path: str,
         cancel_event: threading.Event,
@@ -1397,9 +1404,10 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             com_initialized = True
 
             attachments = list_excel_attachments(
-                file_name_filter,
-                folder_path,
-                cancel_event,
+                required_keyword=required_keyword,
+                file_name_filter=file_name_filter,
+                folder_path=folder_path,
+                cancel_event=cancel_event,
             )
             check_cancelled(cancel_event)
 

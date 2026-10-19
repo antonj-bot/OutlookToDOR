@@ -8,7 +8,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from backend.config import required_keyword
 from backend.exceptions import ProcessCancelled, check_cancelled
 from backend.logging_setup import logger
 from backend.models import AttachmentInfo
@@ -17,21 +16,22 @@ from backend.outlook.folders import get_outlook_folder
 from backend.excel.source_reader import is_excel_file
 
 def list_excel_attachments(
+    required_keyword: str = "",
     file_name_filter: str = "",
     folder_path: str = "Inbox",
     cancel_event: threading.Event | None = None,
 ) -> list[AttachmentInfo]:
     """
-    Searches recent Outlook messages in the selected folder for matching
-    Excel attachments.
+    Searches Outlook messages for supported attachments whose filenames
+    contain the required keyword and optional additional filter.
 
-    Every result must contain REQUIRED_ATTACHMENT_KEYWORD in its filename.
-    The optional file_name_filter narrows those results further.
-
+    An empty required keyword includes all supported attachments.
     Results are returned newest first.
     """
     check_cancelled(cancel_event)
+
     namespace = get_outlook_namespace()
+
     outlook_folder = get_outlook_folder(
         namespace,
         folder_path,
@@ -45,15 +45,17 @@ def list_excel_attachments(
         "[ReceivedTime]",
         True,
     )
+
     check_cancelled(cancel_event)
 
-    requested_text = (
-        file_name_filter
+    normalized_required_keyword = (
+        required_keyword
         .strip()
         .casefold()
     )
-    normalized_required_keyword = (
-        required_keyword
+
+    requested_text = (
+        file_name_filter
         .strip()
         .casefold()
     )
