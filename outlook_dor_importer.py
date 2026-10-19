@@ -72,8 +72,8 @@ from backend.excel.summaries import (
     find_existing_week,
     get_dor_summary_values,
 )
-from backend.excel.undo import (
-    undo_imported_data,
+from backend.excel.remove import (
+    remove_imported_data,
 )
 from backend.exceptions import (
     ProcessCancelled,

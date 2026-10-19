@@ -21,7 +21,7 @@ from backend.excel.highlighting import (
     highlight_imported_data_ranges,
 )
 from backend.excel.source_reader import extract_date_from_filename, parse_date
-from backend.excel.undo import undo_imported_data
+from backend.excel.remove import remove_imported_data
 from backend.logging_setup import logger
 from backend.models import AttachmentInfo, SessionTimer
 from backend.outlook.attachments import list_excel_attachments, save_attachment
@@ -70,9 +70,9 @@ class OutlookDORImporterApp(tk.Tk):
         self.imported_ranges: list[dict] = []
         self.import_records: list[dict] = []
         self.import_batch_counter = 0
-        self.undo_batch_id: int | None = None
-        self.undo_batch_total = 0
-        self.undo_batch_completed = 0
+        self.remove_batch_id: int | None = None
+        self.remove_batch_total = 0
+        self.remove_batch_completed = 0
         self.imported_data_highlighted = False
 
         self.queue_var = tk.StringVar(
@@ -820,17 +820,17 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             state="disabled",
         )
 
-        self.undo_import_button = ttk.Button(
+        self.remove_import_button = ttk.Button(
             action_frame,
-            text="Undo Last Import",
-            command=self.undo_last_import,
+            text="Remove Last Import",
+            command=self.remove_last_import,
             state="disabled",
         )
 
-        self.undo_batch_button = ttk.Button(
+        self.remove_batch_button = ttk.Button(
             action_frame,
-            text="Undo Last Batch",
-            command=self.undo_last_batch,
+            text="Remove Last Batch",
+            command=self.remove_last_batch,
             state="disabled",
         )
 
@@ -850,10 +850,11 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             side="left",
             padx=(0, 6),
         )
-        self.undo_import_button.pack(
+        self.remove_import_button.pack(
             side="left",
         )
-        self.undo_batch_button.pack(
+
+        self.remove_batch_button.pack(
             side="left",
             padx=(6, 0),
         )
@@ -952,10 +953,10 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             self.highlight_toggle_button.configure(
                 state="disabled"
             )
-            self.undo_import_button.configure(
+            self.remove_import_button.configure(
                 state="disabled"
             )
-            self.undo_batch_button.configure(
+            self.remove_batch_button.configure(
                 state="disabled"
             )
             self.refresh_folders_button.configure(
@@ -987,7 +988,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                 ),
                 state=("normal" if self.imported_ranges else "disabled"),
             )
-            self.undo_import_button.configure(
+            self.remove_import_button.configure(
                 state=("normal" if self.import_records else "disabled")
             )
             latest_batch_id = (
@@ -999,7 +1000,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                 record.get("batch_id") == latest_batch_id
                 for record in self.import_records
             )
-            self.undo_batch_button.configure(
+            self.remove_batch_button.configure(
                 state=("normal" if latest_batch_count > 1 else "disabled")
             )
             self.refresh_folders_button.configure(
@@ -2117,7 +2118,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             self.close_after_unhighlight = False
             self._finish_close_application()
 
-    def _ranges_after_undo(
+    def _ranges_after_removal(
         self,
         import_record: dict,
     ) -> tuple[list[dict], list[dict]]:
@@ -2222,13 +2223,13 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                 import_record["dor_row"] = dor_ranges[0]["first_row"]
                 import_record["result"]["dor_row"] = dor_ranges[0]["first_row"]
 
-    def undo_last_import(self):
+    def remove_last_import(self):
         if self.action_active or not self.import_records:
             return
 
-        self._start_undo_import(self.import_records[-1])
+        self._start_remove_import(self.import_records[-1])
 
-    def undo_last_batch(self):
+    def remove_last_batch(self):
         if self.action_active or len(self.import_records) < 2:
             return
 
@@ -2240,41 +2241,41 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         if batch_count < 2:
             return
         if not messagebox.askyesno(
-            "Undo Last Batch",
-            f"Undo all {batch_count} imports from the latest batch?",
+            "remove Last Batch",
+            f"remove all {batch_count} imports from the latest batch?",
         ):
             return
 
-        self.undo_batch_id = batch_id
-        self.undo_batch_total = batch_count
-        self.undo_batch_completed = 0
-        self._undo_next_batch_import()
+        self.remove_batch_id = batch_id
+        self.remove_batch_total = batch_count
+        self.remove_batch_completed = 0
+        self._remove_next_batch_import()
 
-    def _undo_next_batch_import(self):
-        if self.action_active or self.undo_batch_id is None:
+    def _remove_next_batch_import(self):
+        if self.action_active or self.remove_batch_id is None:
             return
         if self.cancel_event.is_set():
-            completed = self.undo_batch_completed
-            total = self.undo_batch_total
-            self._clear_undo_batch_state()
+            completed = self.remove_batch_completed
+            total = self.remove_batch_total
+            self._clear_remove_batch_state()
             self.set_busy(False)
-            self.set_activity("Batch undo cancelled")
+            self.set_activity("Batch remove cancelled")
             self.status_var.set(
-                f"Batch undo cancelled after {completed} of {total} import(s)."
+                f"Batch remove cancelled after {completed} of {total} import(s)."
             )
             return
         if (
             not self.import_records
-            or self.import_records[-1].get("batch_id") != self.undo_batch_id
+            or self.import_records[-1].get("batch_id") != self.remove_batch_id
         ):
-            self._clear_undo_batch_state()
+            self._clear_remove_batch_state()
             self.set_busy(False)
             return
 
-        self._start_undo_import(self.import_records[-1])
+        self._start_remove_import(self.import_records[-1])
 
-    def _start_undo_import(self, import_record: dict):
-        ranges_to_remove, remaining_ranges = self._ranges_after_undo(
+    def _start_remove_import(self, import_record: dict):
+        ranges_to_remove, remaining_ranges = self._ranges_after_removal(
             import_record
         )
         rehighlight_remaining = (
@@ -2283,15 +2284,15 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         )
 
         self.set_busy(True)
-        if self.undo_batch_id is not None:
+        if self.remove_batch_id is not None:
             self.set_activity(
-                f"Undoing batch import {self.undo_batch_completed + 1} "
-                f"of {self.undo_batch_total}..."
+                f"removeing batch import {self.remove_batch_completed + 1} "
+                f"of {self.remove_batch_total}..."
             )
         else:
-            self.set_activity("Undoing the last import...")
+            self.set_activity("removeing the last import...")
         threading.Thread(
-            target=self._undo_last_import_worker,
+            target=self._remove_last_import_worker,
             args=(
                 import_record,
                 ranges_to_remove,
@@ -2301,7 +2302,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             daemon=True,
         ).start()
 
-    def _undo_last_import_worker(
+    def _remove_last_import_worker(
         self,
         import_record: dict,
         ranges_to_remove: list[dict],
@@ -2314,7 +2315,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         try:
             pythoncom.CoInitialize()
             com_initialized = True
-            undo_imported_data(
+            remove_imported_data(
                 import_record["result"],
                 import_record["raw_row_segments"],
                 import_record["dor_row"],
@@ -2330,14 +2331,14 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                 pythoncom.CoUninitialize()
 
         self.post_ui_event(
-            self._finish_undo_last_import,
+            self._finish_remove_last_import,
             import_record,
             remaining_ranges,
             rehighlight_remaining,
             error,
         )
 
-    def _finish_undo_last_import(
+    def _finish_remove_last_import(
         self,
         import_record: dict,
         remaining_ranges: list[dict],
@@ -2345,25 +2346,25 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         error: Exception | None,
     ):
         if error is not None:
-            batch_completed = self.undo_batch_completed
-            batch_total = self.undo_batch_total
-            is_batch_undo = self.undo_batch_id is not None
-            self._clear_undo_batch_state()
+            batch_completed = self.remove_batch_completed
+            batch_total = self.remove_batch_total
+            is_batch_remove = self.remove_batch_id is not None
+            self._clear_remove_batch_state()
             self.set_busy(False)
             if isinstance(error, ProcessCancelled):
-                self.set_activity("Undo cancelled")
-                if is_batch_undo:
+                self.set_activity("remove cancelled")
+                if is_batch_remove:
                     self.status_var.set(
-                        f"Batch undo cancelled after {batch_completed} "
+                        f"Batch remove cancelled after {batch_completed} "
                         f"of {batch_total} import(s)."
                     )
                 else:
                     self.status_var.set(
-                        "Undo cancelled before data was removed."
+                        "remove cancelled before data was removed."
                     )
             else:
-                self.set_activity("Undo failed")
-                self.show_error("Could not undo the last import", error)
+                self.set_activity("remove failed")
+                self.show_error("Could not remove the last import", error)
             return
 
         self.imported_ranges = remaining_ranges
@@ -2373,41 +2374,41 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         self.imported_data_highlighted = rehighlight_remaining
 
         if (
-            self.undo_batch_id is not None
-            and import_record.get("batch_id") == self.undo_batch_id
+            self.remove_batch_id is not None
+            and import_record.get("batch_id") == self.remove_batch_id
         ):
-            self.undo_batch_completed += 1
+            self.remove_batch_completed += 1
             if (
                 self.import_records
-                and self.import_records[-1].get("batch_id") == self.undo_batch_id
+                and self.import_records[-1].get("batch_id") == self.remove_batch_id
             ):
                 self.set_busy(False)
                 self.status_var.set(
-                    f"Undid {self.undo_batch_completed} of "
-                    f"{self.undo_batch_total} imports; continuing batch undo..."
+                    f"Undid {self.remove_batch_completed} of "
+                    f"{self.remove_batch_total} imports; continuing batch remove..."
                 )
-                self._undo_next_batch_import()
+                self._remove_next_batch_import()
                 return
 
-            completed = self.undo_batch_completed
-            self._clear_undo_batch_state()
+            completed = self.remove_batch_completed
+            self._clear_remove_batch_state()
             self.set_busy(False)
             self.status_var.set(
                 f"Undid all {completed} imports from the latest batch."
             )
-            self.set_activity("Batch imports undone", done=True)
+            self.set_activity("Batch imports removene", done=True)
             return
 
         self.set_busy(False)
         self.status_var.set(
             "Undid the last import and refreshed the summary pivots."
         )
-        self.set_activity("Last import undone", done=True)
+        self.set_activity("Last import removene", done=True)
 
-    def _clear_undo_batch_state(self):
-        self.undo_batch_id = None
-        self.undo_batch_total = 0
-        self.undo_batch_completed = 0
+    def _clear_remove_batch_state(self):
+        self.remove_batch_id = None
+        self.remove_batch_total = 0
+        self.remove_batch_completed = 0
 
     def _record_imported_range(
         self,

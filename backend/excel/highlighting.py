@@ -117,12 +117,6 @@ def clear_imported_data_highlight(
                 f'{imported_range.get("sheet", "Unknown sheet")}: {error}'
             )
 
-    for workbook in changed_workbooks.values():
-        try:
-            workbook.Save()
-        except Exception as error:
-            failures.append(f"Could not save {workbook.Name}: {error}")
-
     if cancelled_error is not None:
         raise cancelled_error
     if failures:
@@ -200,12 +194,8 @@ def highlight_imported_data_ranges(
 
         check_cancelled(cancel_event)
     except ProcessCancelled:
-        for workbook in changed_workbooks.values():
-            workbook.Save()
         raise
 
-    for workbook in changed_workbooks.values():
-        workbook.Save()
 def refresh_destination_workbook_data(
     excel,
     destination_workbook,

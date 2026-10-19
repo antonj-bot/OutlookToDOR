@@ -1,4 +1,6 @@
-"""Source filename/date parsing and filtered worksheet row reading."""
+"""Utilities for parsing source workbook data, detecting headers and dates,
+filtering rows by work type, and preparing worksheet data for import.
+"""
 
 import difflib
 import re

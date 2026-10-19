@@ -1,4 +1,6 @@
-"""Reading DOR summary metrics and locating existing production weeks."""
+"""Utilities for reading DOR summary metrics, tracking their source cells,
+and locating existing production dates and week values.
+"""
 
 from datetime import date, datetime
 import threading
