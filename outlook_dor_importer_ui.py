@@ -2047,6 +2047,11 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             "Highlighted imported rows, DOR entries, and pivot values."
         )
         self.set_activity("Imported data highlighted", done=True)
+        
+        self.notify_action_complete(
+            "Highlighting complete",
+            "Imported rows, DOR entries, and pivot values were highlighted.",
+        )
 
     def unhighlight_imported_data(self):
         if self.action_active or not self.imported_ranges:
@@ -2059,6 +2064,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             args=([dict(item) for item in self.imported_ranges],),
             daemon=True,
         ).start()
+        
 
     def _unhighlight_imported_data_worker(
         self,
@@ -2117,6 +2123,13 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         if self.close_after_unhighlight:
             self.close_after_unhighlight = False
             self._finish_close_application()
+
+        
+        self.notify_action_complete(
+            "Highlight removal complete",
+            "highlights were removed",
+        )
+        
 
     def _ranges_after_removal(
         self,
@@ -2286,11 +2299,11 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         self.set_busy(True)
         if self.remove_batch_id is not None:
             self.set_activity(
-                f"removeing batch import {self.remove_batch_completed + 1} "
+                f"removing batch import {self.remove_batch_completed + 1} "
                 f"of {self.remove_batch_total}..."
             )
         else:
-            self.set_activity("removeing the last import...")
+            self.set_activity("removing the last import...")
         threading.Thread(
             target=self._remove_last_import_worker,
             args=(
@@ -2396,14 +2409,27 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
             self.status_var.set(
                 f"Undid all {completed} imports from the latest batch."
             )
+                
+            self.notify_action_complete(
+                "Imported Batch Removal Complete",
+                "The imported batch removed"
+            )
             self.set_activity("Removed last batch imports", done=True)
             return
+            
 
         self.set_busy(False)
         self.status_var.set(
             "Undid the last import and refreshed the summary pivots."
         )
-        self.set_activity("Last import removene", done=True)
+        self.set_activity("Last import removed", done=True)
+        
+        
+        self.notify_action_complete(
+            "Last Import Removal Complete",
+            "The last import was successfully removed."
+            
+        )
 
     def _clear_remove_batch_state(self):
         self.remove_batch_id = None
