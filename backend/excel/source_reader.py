@@ -136,36 +136,31 @@ def parse_date(value: str) -> date:
         "Production Date must be entered as "
         "YYYY-MM-DD or MM/DD/YYYY."
     )
+    
 def fallback_week(
     production_date: date,
 ) -> str:
     """
-    Fallback week calculation.
+    Calculates the week within the production date's month.
 
-    January 1 through January 7 = Week 1
-    January 8 through January 14 = Week 2
+    Days 1 through 7 = Week 1
+    Days 8 through 14 = Week 2
+    Days 15 through 21 = Week 3
+    Days 22 through the end of the month = Week 4
 
-    The importer first tries to find the date in the destination
-    workbook and reuse the Week value found there.
+    The importer first tries to reuse the Week value for an existing
+    Production Date in the destination workbook.
 
-    This function is only used when the date does not already exist
+    This fallback is used only when the date does not already exist
     and the user has not entered a Week override.
     """
-    first_day_of_year = date(
-        production_date.year,
-        1,
-        1,
+    week_number = min(
+        ((production_date.day - 1) // 7) + 1,
+        4,
     )
 
-    days_from_start = (
-        production_date - first_day_of_year
-    ).days
-
-    week_number = (
-        days_from_start // 7
-    ) + 1
-
     return f"Week {week_number}"
+
 def to_python_date(value) -> date | None:
     """
     Converts an Excel date value into a Python date.
