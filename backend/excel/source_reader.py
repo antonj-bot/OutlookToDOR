@@ -418,6 +418,11 @@ def read_filtered_source_rows(
         "agent",
         "agent name",
     }
+    
+    elapsed_time_names = {
+        "elapsed time",
+        "elapsedtime",
+    }
 
     _, work_type_index = find_matching_header(
         header_positions,
@@ -430,7 +435,12 @@ def read_filtered_source_rows(
         username_names,
         "Username",
     )
-
+    _, elapsed_time_index = find_matching_header(
+        header_positions,
+        elapsed_time_names,
+        "ELAPSED TIME",
+    )
+    
     # Keep every source column except Username so the copied values stay
     # aligned with the attachment's original column order.
     included_column_indexes = [
@@ -472,6 +482,20 @@ def read_filtered_source_rows(
             work_type_value,
             selected_queue,
         ):
+            continue
+        
+        elapsed_time_value = (
+            source_row[elapsed_time_index]
+            if elapsed_time_index < len(source_row)
+            else None
+        )
+
+        try:
+            elapsed_time = float(elapsed_time_value)
+        except (TypeError, ValueError):
+            continue
+
+        if elapsed_time >= 100:
             continue
 
         output_row = []
