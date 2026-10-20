@@ -102,24 +102,49 @@ def append_dor_import_record(
     production_date: date,
     summary_values: tuple,
     highlight_imported_data: bool = False,
-) -> int:
-    """Writes the imported report's summary values to the DOR sheet."""
-    dor_row = 5
-    row_inserted = False
+) -> tuple[int, bool]:
+    """
+    Writes the report's summary values to the DOR sheet in date order
+    (earliest at the top). Returns (dor_row, row_inserted).
+    """
+    first_data_row = 5
 
-    if has_value(dor_sheet.Cells(5, 1).Value):
-        dor_row = 6
-        insert_destination_rows(
-            dor_sheet,
-            dor_row,
-            1,
-        )
-        row_inserted = True
+    # Excel serial number avoids pywin32 timezone shifting.
+    excel_date_serial = (production_date - date(1899, 12, 30)).days
 
-    report_date = datetime.combine(
-        production_date,
-        datetime.min.time(),
+    last_row = int(
+        dor_sheet.Cells(dor_sheet.Rows.Count, 1).End(XL_UP).Row
     )
+
+    dor_row = None
+
+    if last_row >= first_data_row:
+        column_values = range_to_rows(
+            dor_sheet.Range(
+                dor_sheet.Cells(first_data_row, 1),
+                dor_sheet.Cells(last_row, 1),
+            ).Value2
+        )
+
+        for offset, row_values in enumerate(column_values):
+            value = row_values[0] if row_values else None
+
+            if isinstance(value, (int, float)):
+                # First existing date later than ours: go above it.
+                if int(value) > excel_date_serial:
+                    dor_row = first_data_row + offset
+                    break
+            elif has_value(value):
+                # Non-date text (e.g. a total row): stay above it.
+                dor_row = first_data_row + offset
+                break
+
+    if dor_row is None:
+        dor_row = max(first_data_row, last_row + 1)
+        row_inserted = False
+    else:
+        insert_destination_rows(dor_sheet, dor_row, 1)
+        row_inserted = True
 
     try:
         write_matrix(
@@ -127,7 +152,7 @@ def append_dor_import_record(
             dor_row,
             1,
             [[
-                report_date,
+                excel_date_serial,
                 None,
                 *summary_values[:8],
                 None,
@@ -137,33 +162,23 @@ def append_dor_import_record(
                 summary_values[10],
             ]],
         )
-        dor_sheet.Cells(
-            dor_row,
-            1,
-        ).NumberFormat = "dddd, mmmm d, yyyy"
-        dor_sheet.Cells(
-            dor_row,
-            11,
-        ).FormulaR1C1 = "=IFERROR(RC[-1]/RC[-7],0)"
-        dor_sheet.Cells(
-            dor_row,
-            14,
-        ).FormulaR1C1 = "=IFERROR(RC[-1]/RC[-10],0)"
+
+        dor_sheet.Cells(dor_row, 1).NumberFormat = "dddd, mmmm d, yyyy"
+        dor_sheet.Cells(dor_row, 11).FormulaR1C1 = "=IFERROR(RC[-1]/RC[-7],0)"
+        dor_sheet.Cells(dor_row, 14).FormulaR1C1 = "=IFERROR(RC[-1]/RC[-10],0)"
+
         if highlight_imported_data:
             dor_sheet.Range(
                 dor_sheet.Cells(dor_row, 1),
                 dor_sheet.Cells(dor_row, 15),
             ).Interior.Color = IMPORTED_DATA_HIGHLIGHT_COLOR
+
         for column_number, source_color in DOR_COLUMN_SOURCE_COLORS.items():
-            dor_sheet.Cells(
-                dor_row,
-                column_number,
-            ).Interior.Color = source_color
+            dor_sheet.Cells(dor_row, column_number).Interior.Color = source_color
+
     except Exception:
         if row_inserted:
-            dor_sheet.Rows("6:6").Delete(
-                Shift=XL_UP,
-            )
+            dor_sheet.Rows(f"{dor_row}:{dor_row}").Delete(Shift=XL_UP)
         else:
             dor_sheet.Range(
                 dor_sheet.Cells(dor_row, 1),
@@ -171,7 +186,8 @@ def append_dor_import_record(
             ).ClearContents()
         raise
 
-    return dor_row
+    return dor_row, row_inserted
+
 def write_matrix(
     destination_sheet,
     first_row: int,

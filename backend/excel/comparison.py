@@ -226,7 +226,7 @@ def append_dor_comparison_record(
                 source_column_values[dor_column]
                 if source_column_values is not None
                 and dor_column in source_column_values
-                else dor_sheet.Cells(dor_row, dor_column).Value
+                else dor_sheet.Cells(dor_row, dor_column).Value2
             )
             comparison_sheet.Cells(
                 row_number,

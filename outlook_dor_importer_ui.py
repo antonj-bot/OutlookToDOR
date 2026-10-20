@@ -1749,7 +1749,15 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
                 )
 
                 return
-
+            
+        selected_attachments.sort(
+            key=lambda attachment: (
+                extract_date_from_filename(attachment.file_name)
+                or fallback_date
+                or date.min
+            )
+        )
+        
         self.set_activity("Starting import...")
         self.set_busy(True)
         self.update_progress(

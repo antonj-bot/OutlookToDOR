@@ -178,10 +178,17 @@ def import_attachment(
             cancel_event,
         )
 
+        high_elapsed_info = {}
+
+        def record_high_elapsed_export(export_path, row_count):
+            high_elapsed_info["path"] = str(export_path)
+            high_elapsed_info["count"] = row_count
+
         result = read_filtered_source_rows(
             source_sheet,
             selected_queue,
             cancel_event,
+            on_high_elapsed_export=record_high_elapsed_export,
         )
 
         logger.info(
@@ -391,7 +398,7 @@ def import_attachment(
                     pivot_source_range["first_column"],
                 ).Interior.Color = pivot_source_range["source_color"]
 
-        dor_row = append_dor_import_record(
+        dor_row, dor_row_inserted = append_dor_import_record(
             dor_sheet,
             production_date,
             summary_values,
@@ -497,6 +504,7 @@ def import_attachment(
             "week": week_value,
             "week_source": week_source,
             "dor_row": dor_row,
+            "dor_row_inserted": dor_row_inserted,
             "dor_comparison_row": (
                 comparison_ranges[0]["first_row"]
                 if comparison_ranges
@@ -525,6 +533,7 @@ def import_attachment(
             "raw_rows_inserted": row_override is not None,
             "highlight_imported_data": highlight_imported_data,
             "highlight_ranges": highlight_ranges,
+            "high_elapsed_export": high_elapsed_info or None,
         }
 
     finally:

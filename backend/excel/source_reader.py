@@ -7,11 +7,14 @@ import re
 import threading
 from datetime import date, datetime
 from pathlib import Path
+from typing import Callable
 
 from backend.config import ALLOWED_EXCEL_EXTENSIONS, WORK_TYPE_MATCH_VALUES
 from backend.exceptions import check_cancelled
 from backend.logging_setup import logger
 from backend.excel.ranges import range_to_rows
+
+
 
 def normalize(value) -> str:
     """
@@ -361,22 +364,104 @@ def work_type_matches(
         accepted_value in work_type_text
         for accepted_value in accepted_values
     )
+
+def export_high_elapsed_time_rows(
+    source_sheet,
+    headers: list[str],
+    rows: list[list],
+) -> Path | None:
+    """
+    Exports rows with ELAPSED TIME >= 100 to Downloads using a
+    separate hidden Excel instance, so nothing pops up.
+    """
+    if not rows:
+        return None
+
+    import win32com.client
+
+    APP_DIR = Path(__file__).resolve().parents[2]   # excel -> backend -> project root
+    export_folder = APP_DIR / "HighElapsedTime"
+    export_folder.mkdir(parents=True, exist_ok=True)
+
+    source_name = Path(str(source_sheet.Parent.Name)).stem
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    export_path = export_folder / f"High_Elapsed_Time_{source_name}_{timestamp}.xlsx"
+
+    # DispatchEx = brand-new Excel process, separate from the user's Excel.
+    hidden_excel = win32com.client.DispatchEx("Excel.Application")
+    hidden_excel.Visible = False
+    hidden_excel.DisplayAlerts = False
+    hidden_excel.ScreenUpdating = False
+
+    export_workbook = None
+
+    try:
+        export_workbook = hidden_excel.Workbooks.Add()
+        export_sheet = export_workbook.Worksheets(1)
+        export_sheet.Name = "Elapsed Time 100+"
+
+        column_count = len(headers)
+        row_count = len(rows)
+
+        export_sheet.Range(
+            export_sheet.Cells(1, 1),
+            export_sheet.Cells(1, column_count),
+        ).Value = tuple(headers)
+
+        export_sheet.Range(
+            export_sheet.Cells(2, 1),
+            export_sheet.Cells(row_count + 1, column_count),
+        ).Value = tuple(tuple(row) for row in rows)
+
+        header_range = export_sheet.Range(
+            export_sheet.Cells(1, 1),
+            export_sheet.Cells(1, column_count),
+        )
+        header_range.Font.Bold = True
+        header_range.Interior.Color = 15921906
+
+        try:
+            export_sheet.Range(
+                export_sheet.Cells(1, 1),
+                export_sheet.Cells(row_count + 1, column_count),
+            ).AutoFilter(1)
+        except Exception as error:
+            logger.warning("Could not add AutoFilter to export: %s", error)
+
+        export_sheet.Columns.AutoFit()
+
+        export_workbook.SaveAs(str(export_path), FileFormat=51)
+
+    finally:
+        if export_workbook is not None:
+            export_workbook.Close(SaveChanges=False)
+        hidden_excel.Quit()
+
+    logger.info(
+        "Exported %d rows with ELAPSED TIME >= 100 to %s",
+        len(rows),
+        export_path,
+    )
+    return export_path
+
+
 def read_filtered_source_rows(
     source_sheet,
     selected_queue: str,
     cancel_event: threading.Event | None = None,
+    on_high_elapsed_export: Callable[[Path, int], None] | None = None,
 ) -> tuple[list[str], list[list]]:
     """
     Reads ordinary worksheet cells.
 
     Rules:
     1. Finds a header row.
-    2. Copies every data row.
-    3. Excludes only the Username column.
-    4. Preserves blank cells and columns.
-    5. Returns (headers, rows).
+    2. Keeps rows matching the selected Work Type.
+    3. Imports rows with ELAPSED TIME below 100.
+    4. Exports rows with ELAPSED TIME of 100 or above to Downloads.
+    5. Excludes only the Username column.
+    6. Returns (headers, rows).
     """
-
     check_cancelled(cancel_event)
     used_range = source_sheet.UsedRange
 
@@ -462,6 +547,7 @@ def read_filtered_source_rows(
         )
 
     filtered_rows = []
+    high_elapsed_time_rows = []
 
     data_start_index = (
         header_row_index + 1
@@ -496,7 +582,22 @@ def read_filtered_source_rows(
             continue
 
         if elapsed_time >= 100:
+            high_elapsed_row = []
+
+            for column_index in included_column_indexes:
+                if column_index < len(source_row):
+                    cell_value = source_row[column_index]
+                else:
+                    cell_value = None
+
+                high_elapsed_row.append(cell_value)
+
+            high_elapsed_time_rows.append(
+                high_elapsed_row
+            )
+
             continue
+
 
         output_row = []
 
@@ -523,7 +624,26 @@ def read_filtered_source_rows(
         filtered_rows.append(
             output_row
         )
+    export_path = None
 
+    try:
+        export_path = export_high_elapsed_time_rows(
+            source_sheet,
+            included_headers,
+            high_elapsed_time_rows,
+        )
+    except Exception as error:
+        logger.warning("Could not export high elapsed-time rows: %s", error)
+
+    if export_path:
+        logger.info("High elapsed-time report created: %s", export_path)
+
+        if on_high_elapsed_export is not None:
+            on_high_elapsed_export(
+                export_path,
+                len(high_elapsed_time_rows),
+            )
+        
     if not filtered_rows:
         raise RuntimeError(
             f'No {selected_queue} data rows were found after '
