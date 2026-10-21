@@ -529,7 +529,6 @@ def import_attachment(
             "workbook": str(
                 destination_workbook.Name
             ),
-            "dor_row_inserted": dor_row == 6,
             "raw_rows_inserted": row_override is not None,
             "highlight_imported_data": highlight_imported_data,
             "highlight_ranges": highlight_ranges,
